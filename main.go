@@ -35,6 +35,8 @@ func orchMain(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return listAgents(stdout)
 	case "run":
 		return cmdRun(args[1:], stdin, stdout, stderr)
+	case "build":
+		return cmdBuild(args[1:], stdin, stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "orch %s\n", version)
 		return 0
@@ -187,6 +189,7 @@ func usage(w io.Writer) {
 Usage
   orch list                          list agents and whether they are installed
   orch run <agent> [agent...] [flags] run agents in the current terminal
+  orch build "<task>" [flags]        plan, implement, review and verify a task
   orch version                       print the orch version
   orch help                          print this message
 
@@ -201,11 +204,21 @@ Flags for run
   -p, --prompt <text>  start each agent interactively with this first message
   -- <args...>         extra args for the agent (single-agent runs only)
 
+Flags for build
+  -C, --dir <path>     repository the agents work in (default: current)
+
 Agents run one after another, each owning the terminal; if one exits non-zero
 the rest are skipped and orch exits with that code.
 
 Every agent gets its own pseudo-terminal, so its native UI and its own
 permission prompts work as usual. orch adds no approval-skipping flags, and
 refuses to pass through any you supply after --.
+
+orch build runs agy to plan, command-code to review the plan, agy to implement,
+then command-code to review the implementation, fixing and re-reviewing up to
+three times until a review explicitly approves. Each stage is a normal
+interactive session with its own permission prompts, and every stage's output
+is saved under .orch/<run-id>/. The run finishes with gofmt, go vet ./... and
+go test ./... in the repository.
 `)
 }
