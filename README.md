@@ -127,6 +127,37 @@ Every run creates a timestamped directory under `.orch/<run-id>/` containing Mar
 
 If changes are requested, subsequent fix and review cycles continue numbering sequentially (e.g. `5-fix.md`, `6-review.md`, etc.).
 
+### `orch status`
+
+Lists the workflow runs recorded under `.orch/`, newest first, with each run's stage count and the verdict of its final review (`APPROVED`, `REJECTED`, or `-` when no review artifact exists). A missing `.orch/` is not an error; it reports that no runs exist yet.
+
+```sh
+orch status
+```
+
+```
+RUN-ID            STAGES  VERDICT
+20260921-180819        4  APPROVED
+20260921-170242        4  APPROVED
+```
+
+### `orch logs <run-id>`
+
+Lists the artifacts of a single run — the numbered Markdown reports and their raw terminal transcripts, plus `verify.log` — in stage order with their sizes. The `<run-id>` is the timestamp directory name under `.orch/` and the first column of `orch status`. Invalid, unknown, or path-traversing run ids are rejected with exit code `2`.
+
+```sh
+orch logs 20260921-180819
+```
+
+```
+artifacts in .orch/20260921-180819:
+  1-plan.log         121.1 KB
+  1-plan.md            3.5 KB
+  2-plan-review.log  814.5 KB
+  ...
+  verify.log             19 B
+```
+
 ### `orch version` (aliases: `-v`, `--version`)
 
 Prints the current version (`orch 0.1.0`).

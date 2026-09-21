@@ -194,8 +194,18 @@ Usage
   orch list                          list agents and whether they are installed
   orch run <agent> [agent...] [flags] run agents in the current terminal
   orch build "<task>" [flags]        plan, implement, review and verify a task
+  orch status                        show the build runs under .orch/, newest first
+  orch logs <run-id>                 list the artifacts of one run
   orch version                       print the orch version
   orch help                          print this message
+
+Examples
+  orch list
+  orch run agy -p "explain how the pty handoff works"
+  orch run agy command-code -C ~/src/app
+  orch build "add a --json flag to the report command"
+  orch status
+  orch logs 20260101-120000
 
 Agents
   agy           Antigravity CLI (native terminal UI)
@@ -210,6 +220,12 @@ Flags for run
 
 Flags for build
   -C, --dir <path>     repository the agents work in (default: current)
+
+Status and logs
+  orch status lists each run under .orch/ with its stage count and the verdict
+  of its final review. orch logs <run-id> lists that run's Markdown artifacts
+  and raw terminal transcripts so you can read or open them; the run id is the
+  directory name under .orch/ and the first column of orch status.
 
 Agents run one after another, each owning the terminal; if one exits non-zero
 the rest are skipped and orch exits with that code.
