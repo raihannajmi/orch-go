@@ -34,7 +34,24 @@ const (
 	// buildContextLimit caps how much of each prior artifact is inlined into the
 	// next stage's prompt; the full file is always referenced by path.
 	buildContextLimit = 8000
+
+	// stageMarker is the explicit completion signal every stage writes as the
+	// final line of its artifact. An interactive agent finishes its work but
+	// stays at its prompt, so orch watches the artifact for this line and ends
+	// the session once it lands instead of waiting on the agent to quit. It is
+	// part of the artifact protocol, not an instruction the agent may ignore:
+	// without it orch cannot tell "still working" from "done and idle".
+	stageMarker = "ORCH_STAGE_COMPLETE"
+	// stagePollInterval is how often orch re-reads the artifact for the marker.
+	stagePollInterval = 200 * time.Millisecond
 )
+
+// doneInstruction is appended to every stage prompt. It defines the completion
+// signal the workflow depends on and tells the agent not to quit the session
+// itself, since orch closes it once the marker is detected.
+const doneInstruction = `
+
+When, and only when, everything above is finished, write ` + stageMarker + ` on a line by itself as the very last line of that file. orch watches the file for that line and ends this session as soon as it appears, so write it only after all other work is done. Do not exit the session yourself.`
 
 // buildOptions is one `orch build` invocation.
 type buildOptions struct {
@@ -249,6 +266,12 @@ func reviewApproved(review string) bool {
 // interactiveStage is the production stage runner: it launches the agent on a
 // real pty, tees the terminal transcript to <name>.log, then reads back the
 // Markdown artifact the agent was asked to write.
+//
+// The agent does its work and writes the artifact, but an interactive agent
+// keeps its session open at the prompt afterwards, so Run would block forever.
+// orch instead watches the artifact for the stage's completion marker and ends
+// the session once it appears; that keeps native permission prompts in place
+// while the agent works and only stops it after the stage is actually done.
 func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func(string, string, string) (string, error) {
 	return func(agentName, name, prompt string) (string, error) {
 		a, ok := lookupAgent(agentName)
@@ -267,25 +290,87 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func
 		}
 		defer func() { _ = log.Close() }()
 
+		artifact := filepath.Join(runDir, name+".md")
+
+		// Wait for the artifact to carry the completion marker, then close stop
+		// so Run ends the session. completed records that orch — not the agent
+		// quitting on its own — ended the stage, so the exit code is not a
+		// failure.
+		stop := make(chan struct{})
+		sessionDone := make(chan struct{})
+		completed := make(chan struct{})
+		go func() {
+			defer close(stop)
+			if waitForArtifact(artifact, sessionDone) {
+				close(completed)
+			}
+		}()
+
 		code, err := Run(argv, Options{
 			Dir:    dir,
 			Stdin:  stdin,
 			Stdout: io.MultiWriter(stdout, log),
+			Stop:   stop,
 		})
+		close(sessionDone)
 		if err != nil {
 			return "", err
 		}
-		if code != 0 {
-			return "", fmt.Errorf("exited with code %d", code)
+
+		select {
+		case <-completed:
+			// orch ended the session once the artifact was complete.
+		default:
+			if code != 0 {
+				return "", fmt.Errorf("exited with code %d", code)
+			}
 		}
 
-		artifact := filepath.Join(runDir, name+".md")
 		text, err := os.ReadFile(artifact)
 		if err != nil {
 			return "", fmt.Errorf("expected the %s stage to write %s: %w", name, artifact, err)
 		}
-		return string(text), nil
+		return stripStageMarker(string(text)), nil
 	}
+}
+
+// waitForArtifact polls the stage artifact until it ends with the completion
+// marker, reporting true when it does. It reports false if the session ends
+// first, so it never signals a stage that died before finishing.
+func waitForArtifact(path string, sessionDone <-chan struct{}) bool {
+	ticker := time.NewTicker(stagePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sessionDone:
+			return false
+		case <-ticker.C:
+			if artifactComplete(path) {
+				return true
+			}
+		}
+	}
+}
+
+// artifactComplete reports whether the artifact exists and its final content is
+// the completion marker. Requiring the marker to be last means a partially
+// written artifact is never mistaken for a finished one.
+func artifactComplete(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.TrimSpace(string(b)), stageMarker)
+}
+
+// stripStageMarker removes the trailing completion marker so later stages see
+// only the artifact's real content.
+func stripStageMarker(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasSuffix(trimmed, stageMarker) {
+		return strings.TrimSpace(strings.TrimSuffix(trimmed, stageMarker))
+	}
+	return trimmed
 }
 
 // verifyRepo runs the mandated final checks in the repository and fails if any
@@ -374,9 +459,7 @@ Repository: %s
 Investigate the repository and produce a concise implementation plan for the task above. Do not modify any files in this stage.
 
 Write the plan as Markdown to:
-%s
-
-Then exit the session.`, task, dir, out)
+%s`, task, dir, out) + doneInstruction
 }
 
 func planReviewPrompt(task, dir, out string, plan contextDoc) string {
@@ -390,9 +473,7 @@ Repository: %s
 Check the plan against the actual repository and the task. Note gaps, wrong assumptions, and risky steps.
 
 Write your review as Markdown to:
-%s
-
-Then exit the session.`, task, dir, render(plan), out)
+%s`, task, dir, render(plan), out) + doneInstruction
 }
 
 func implementPrompt(task, dir, out string, plan, planReview contextDoc) string {
@@ -406,9 +487,7 @@ Repository: %s
 Make the actual code changes the task requires, following the plan and addressing the plan review.
 
 Write a short Markdown summary of what you changed and why to:
-%s
-
-Then exit the session.`, task, dir, render(plan, planReview), out)
+%s`, task, dir, render(plan, planReview), out) + doneInstruction
 }
 
 func reviewPrompt(task, dir, out string, plan, summary contextDoc) string {
@@ -429,7 +508,7 @@ End the review with a final line in exactly one of these forms:
 VERDICT: APPROVED
 VERDICT: REJECTED
 
-Choose APPROVED only when the task is complete and correct with no required changes. Otherwise choose REJECTED and list the specific changes required.`, task, dir, render(plan, summary), out)
+Choose APPROVED only when the task is complete and correct with no required changes. Otherwise choose REJECTED and list the specific changes required.`, task, dir, render(plan, summary), out) + doneInstruction
 }
 
 func fixPrompt(task, dir, out string, plan, review contextDoc) string {
@@ -443,7 +522,5 @@ Repository: %s
 Address every point raised by the review, then re-verify your own changes.
 
 Write a short Markdown summary of the fixes to:
-%s
-
-Then exit the session.`, task, dir, render(plan, review), out)
+%s`, task, dir, render(plan, review), out) + doneInstruction
 }

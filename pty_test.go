@@ -114,3 +114,31 @@ func TestRunRejectsEmptyCommand(t *testing.T) {
 		t.Fatal("Run(nil) = nil error, want an error")
 	}
 }
+
+// TestRunStopEndsSession covers the mechanism that unblocks the build workflow:
+// a caller that can tell the agent is done closes Stop, and Run ends the still
+// running session instead of waiting for it to exit on its own.
+func TestRunStopEndsSession(t *testing.T) {
+	dir := t.TempDir()
+	ready := dir + "/ready"
+
+	stop := make(chan struct{})
+	go func() {
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				close(stop)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	script := "touch '" + ready + "'\nsleep 3600"
+	code, err := runSession(t, []string{"/bin/sh", "-c", script}, Options{Stdout: &bytes.Buffer{}, Stop: stop})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if code == 0 {
+		t.Errorf("exit code = %d, want the terminated agent's non-zero status", code)
+	}
+}

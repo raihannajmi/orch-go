@@ -5,3 +5,5 @@
 - Prefers minimal architecture: keep the design small and avoid unnecessary machinery or dependencies (YAGNI-style). Confidence: 0.8
 - Comfortable with macOS-specific (darwin-only) implementations when the task is macOS-focused, rather than portability for its own sake. Confidence: 0.7
 - Never bypass, auto-approve, or suppress permission prompts/checks; interactively-surfaced approvals should remain in force. Confidence: 0.75
+- Prefers changes that extend existing working code rather than rewriting it: inspect the current implementation first and only change what the fix requires. Confidence: 0.7
+- After completing a bug fix, wants a concise end-of-task summary covering the root cause, files changed, the mechanism/approach, and the tests run. Confidence: 0.6

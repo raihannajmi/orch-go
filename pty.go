@@ -8,9 +8,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
+
+// stopGracePeriod is how long a session may linger after orch asks it to end
+// before it is killed outright, so a wedged UI cannot stall a workflow.
+const stopGracePeriod = 2 * time.Second
 
 // Options configures one interactive agent session.
 type Options struct {
@@ -23,6 +28,12 @@ type Options struct {
 	Stdin *os.File
 	// Stdout receives the agent's terminal output. Defaults to os.Stdout.
 	Stdout io.Writer
+	// Stop, when non-nil, ends the session on demand: closing it terminates the
+	// agent's process group (SIGTERM, then SIGKILL after stopGracePeriod). The
+	// build workflow uses it once a stage's artifact is complete, because an
+	// interactive agent finishes its work but stays at its prompt. Nothing is
+	// filtered while the session runs, so native permission prompts are intact.
+	Stop <-chan struct{}
 }
 
 // Run starts argv on a new pseudo-terminal wired to the caller's terminal and
@@ -119,11 +130,47 @@ func Run(argv []string, opts Options) (int, error) {
 		go forwardInput(opts.Stdin, ptmx, output)
 	}
 
+	// A caller that knows the agent is done (its artifact is complete) can ask
+	// the session to end rather than waiting for an interactive prompt that may
+	// never close on its own.
+	sessionDone := make(chan struct{})
+	if opts.Stop != nil {
+		go stopSession(cmd, opts.Stop, sessionDone)
+	}
+
 	waitErr := cmd.Wait()
+	close(sessionDone)
 	_ = ptmx.Close()
 	<-output
 
 	return exitCode(waitErr)
+}
+
+// stopSession ends a session whose agent has finished its work but lingers at
+// its prompt. Closing the caller's channel signals the agent's process group to
+// exit; a SIGKILL follows if it is still alive after stopGracePeriod, so a
+// wedged UI cannot stall the workflow. It returns once the agent is gone.
+func stopSession(cmd *exec.Cmd, stop, sessionDone <-chan struct{}) {
+	select {
+	case <-stop:
+	case <-sessionDone:
+		return
+	}
+	killGroup(cmd, syscall.SIGTERM)
+	select {
+	case <-sessionDone:
+	case <-time.After(stopGracePeriod):
+		killGroup(cmd, syscall.SIGKILL)
+	}
+}
+
+// killGroup signals the agent's whole process group. The agent leads its own
+// session (pty.Start), so its group id equals its pid and children follow.
+func killGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
 // forwardInput copies keystrokes to the pty until either side goes away: done is

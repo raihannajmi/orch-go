@@ -11,7 +11,7 @@ A minimal Go CLI orchestrator that runs coding agents in real pseudo-terminals (
 
 ## Prerequisites & Building
 
-- **Go:** Go 1.25+ (pinned as `go 1.25.6` in `go.mod`).
+- **Go:** Go 1.25.6+ (from `go.mod`).
 - **Platform:** macOS (darwin) for interactive full-screen agent UIs. On non-darwin platforms (`term_other.go`), raw mode is not implemented (`errNoRawMode`); the terminal is left untouched, which allows non-interactive or piped execution but will not drive full-screen interactive UIs properly.
 - **Dependencies:** `github.com/creack/pty v1.1.24` (module `orch`).
 - **Agents:** The binaries for agents you wish to run must be installed and available on `$PATH`.
@@ -107,6 +107,9 @@ Executes an automated multi-stage build workflow combining planning, plan review
 **Flags:**
 - `-C, --dir <path>`: Repository directory where agents work (default: current directory).
 
+**Stage Completion Signal:**
+Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
+
 **Artifacts Directory:**
 Every run creates a timestamped directory under `.orch/<run-id>/` containing Markdown reports and raw terminal transcripts:
 ```
@@ -115,12 +118,14 @@ Every run creates a timestamped directory under `.orch/<run-id>/` containing Mar
 ├── 1-plan.log
 ├── 2-plan-review.md
 ├── 2-plan-review.log
-├── 3-implement.md      (or 3-fix.md on subsequent cycles)
+├── 3-implement.md
 ├── 3-implement.log
 ├── 4-review.md
 ├── 4-review.log
 └── verify.log
 ```
+
+If changes are requested, subsequent fix and review cycles continue numbering sequentially (e.g. `5-fix.md`, `6-review.md`, etc.).
 
 ### `orch version` (aliases: `-v`, `--version`)
 

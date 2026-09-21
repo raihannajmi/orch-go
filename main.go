@@ -37,6 +37,10 @@ func orchMain(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return cmdRun(args[1:], stdin, stdout, stderr)
 	case "build":
 		return cmdBuild(args[1:], stdin, stdout, stderr)
+	case "status":
+		return cmdStatus(args[1:], stdout, stderr)
+	case "logs":
+		return cmdLogs(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "orch %s\n", version)
 		return 0
@@ -218,7 +222,8 @@ orch build runs agy to plan, command-code to review the plan, agy to implement,
 then command-code to review the implementation, fixing and re-reviewing up to
 three times until a review explicitly approves. Each stage is a normal
 interactive session with its own permission prompts, and every stage's output
-is saved under .orch/<run-id>/. The run finishes with gofmt, go vet ./... and
-go test ./... in the repository.
+is saved under .orch/<run-id>/. Once a stage writes its completion marker,
+orch ends that session and moves on, so a finished stage cannot stall the run.
+The run finishes with gofmt, go vet ./... and go test ./... in the repository.
 `)
 }

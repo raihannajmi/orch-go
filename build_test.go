@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeBuilder returns a builder whose stage and verify steps are recorded rather
@@ -217,5 +218,112 @@ func TestInteractiveStageMissingArtifact(t *testing.T) {
 	stage := interactiveStage(dir, runDir, nil, io.Discard)
 	if _, err := stage("agy", "1-plan", "prompt"); err == nil {
 		t.Fatal("stage = nil error, want a missing-artifact error")
+	}
+}
+
+// TestInteractiveStageEndsLingeringAgent is the regression test for the
+// orchestration bug: an agent that writes its artifact and then stays at its
+// interactive prompt must not stall the workflow. orch sees the completion
+// marker, ends the session, and returns the artifact.
+func TestInteractiveStageEndsLingeringAgent(t *testing.T) {
+	dir := t.TempDir()
+	runDir := t.TempDir()
+	artifact := filepath.Join(runDir, "1-plan.md")
+
+	binDir := t.TempDir()
+	// Stand-in agent: finish the requested work, then keep the session open the
+	// way a real interactive agent does after replying.
+	script := "#!/bin/sh\n" +
+		"cat > '" + artifact + "' <<'EOF'\nplanned\n" + stageMarker + "\nEOF\n" +
+		"sleep 3600\n"
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in agent: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	stage := interactiveStage(dir, runDir, nil, io.Discard)
+
+	type result struct {
+		text string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		text, err := stage("agy", "1-plan", "prompt")
+		done <- result{text, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("stage: %v (orch should end the agent's session once the artifact is complete)", r.err)
+		}
+		if r.text != "planned" {
+			t.Errorf("stage text = %q, want %q", r.text, "planned")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("stage did not return: orch waited on an agent that finished its work and idled")
+	}
+}
+
+func TestArtifactComplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.md")
+	if artifactComplete(path) {
+		t.Error("missing artifact reported complete")
+	}
+
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(s), 0o644); err != nil {
+			t.Fatalf("write artifact: %v", err)
+		}
+	}
+
+	write("still writing")
+	if artifactComplete(path) {
+		t.Error("artifact without the marker reported complete")
+	}
+	write(stageMarker + "\nmore content\n")
+	if artifactComplete(path) {
+		t.Error("marker that is not the last line reported complete")
+	}
+	write("body\n\n" + stageMarker + "\n")
+	if !artifactComplete(path) {
+		t.Error("artifact ending in the marker not reported complete")
+	}
+}
+
+func TestStripStageMarker(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"body\n" + stageMarker + "\n", "body"},
+		{"body\n\n  " + stageMarker + "  \n", "body"},
+		{"body", "body"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := stripStageMarker(tt.in); got != tt.want {
+			t.Errorf("stripStageMarker(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestStagePromptsRequireMarker guards requirement 9: every stage — plan, plan
+// review, implement, review and fix — must carry the completion signal, not
+// just the ones a change happened to touch.
+func TestStagePromptsRequireMarker(t *testing.T) {
+	body := contextDoc{"context", "/ctx.md", "content"}
+	prompts := map[string]string{
+		"plan":        planPrompt("task", "/repo", "/out.md"),
+		"plan-review": planReviewPrompt("task", "/repo", "/out.md", body),
+		"implement":   implementPrompt("task", "/repo", "/out.md", body, body),
+		"review":      reviewPrompt("task", "/repo", "/out.md", body, body),
+		"fix":         fixPrompt("task", "/repo", "/out.md", body, body),
+	}
+	for name, p := range prompts {
+		if !strings.Contains(p, stageMarker) {
+			t.Errorf("%s prompt does not require the completion marker", name)
+		}
 	}
 }

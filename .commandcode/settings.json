@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(go:*)",
+      "Shell(ls:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}
