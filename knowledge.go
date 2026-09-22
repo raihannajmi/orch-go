@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/raihannajmi/orch-go/knowledge"
 )
@@ -21,7 +22,9 @@ type knowledgeSession struct {
 	warn     func(format string, args ...any)
 }
 
-// load returns context for the task, or nil if the provider fails.
+// load returns context for the task. A provider error is warned about, and any
+// documents that did load are still returned — a failed Graphify enrichment must
+// not throw away the Obsidian context that succeeded.
 func (s *knowledgeSession) load(task string) []knowledge.Document {
 	docs, err := s.provider.Load(context.Background(), knowledge.Request{
 		Task:    task,
@@ -30,7 +33,6 @@ func (s *knowledgeSession) load(task string) []knowledge.Document {
 	})
 	if err != nil {
 		s.warn("knowledge: load failed: %v", err)
-		return nil
 	}
 	return docs
 }
@@ -58,11 +60,15 @@ func (s *knowledgeSession) close() {
 // openKnowledge builds the knowledge session for a build run. Knowledge is
 // opt-in (`--knowledge`) and configured by environment so the CLI stays small:
 //
-//	ORCH_KNOWLEDGE_VAULT    path to an Obsidian vault (required to enable)
-//	ORCH_KNOWLEDGE_PROJECT  project folder under 01-Projects/ (default: repo dir name)
+//	ORCH_KNOWLEDGE_VAULT     path to an Obsidian vault (required to enable)
+//	ORCH_KNOWLEDGE_PROJECT   project folder under 01-Projects/ (default: repo dir name)
+//	ORCH_KNOWLEDGE_GRAPHIFY  truthy to add the Graphify enrichment layer
+//	ORCH_KNOWLEDGE_GRAPH     graph.json to query (default: <vault>/graphify-out/graph.json)
 //
-// A request for knowledge that cannot be satisfied is a warning, not an error:
-// the build continues without it. A nil session means "no knowledge".
+// Obsidian is the source of truth and works on its own; Graphify is an optional,
+// independently enabled read-only enricher. A request for knowledge that cannot
+// be satisfied is a warning, not an error: the build continues without it. A nil
+// session means "no knowledge".
 func openKnowledge(enabled bool, repoDir string, warn func(string, ...any)) *knowledgeSession {
 	if !enabled {
 		return nil
@@ -76,11 +82,31 @@ func openKnowledge(enabled bool, repoDir string, warn func(string, ...any)) *kno
 	if project == "" {
 		project = filepath.Base(repoDir)
 	}
+
+	cfg := knowledge.Config{Vault: vault, Project: project}
+	if envTruthy(os.Getenv("ORCH_KNOWLEDGE_GRAPHIFY")) {
+		graph := os.Getenv("ORCH_KNOWLEDGE_GRAPH")
+		if graph == "" {
+			graph = filepath.Join(vault, "graphify-out", "graph.json")
+		}
+		cfg.Graphify = &knowledge.GraphifyConfig{Graph: graph}
+	}
+
 	return &knowledgeSession{
-		provider: knowledge.Open(knowledge.Config{Vault: vault, Project: project}),
+		provider: knowledge.Open(cfg),
 		project:  project,
 		repoDir:  repoDir,
 		warn:     warn,
+	}
+}
+
+// envTruthy reports whether an environment value turns a feature on.
+func envTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

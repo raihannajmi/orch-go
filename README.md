@@ -139,15 +139,23 @@ The first backend is Obsidian, configured by environment (the CLI stays a single
 | --- | --- |
 | `ORCH_KNOWLEDGE_VAULT` | Absolute path to an Obsidian vault (required to enable) |
 | `ORCH_KNOWLEDGE_PROJECT` | Project folder under `01-Projects/` (default: repository directory name) |
+| `ORCH_KNOWLEDGE_GRAPHIFY` | Truthy (`1`/`true`/`yes`/`on`) to add the optional Graphify enrichment layer |
+| `ORCH_KNOWLEDGE_GRAPH` | `graph.json` to query (default: `<vault>/graphify-out/graph.json`) |
 
 ```sh
 ORCH_KNOWLEDGE_VAULT=~/Obsidian/najmiraihan orch build "harden the auth boundary" --knowledge
+
+# with the optional Graphify enrichment layer
+ORCH_KNOWLEDGE_VAULT=~/Obsidian/najmiraihan ORCH_KNOWLEDGE_GRAPHIFY=1 \
+  orch build "harden the auth boundary" --knowledge
 ```
 
-- **Retrieval:** before planning, orch reads the project's context note plus only the decisions/problems/learning notes whose filenames match the task. The whole vault is never read.
-- **Trust boundary:** loaded knowledge is untrusted data. It is injected into the planning prompt only inside an explicit `<external_knowledge>…</external_knowledge>` fence, labeled as reference material that must not be followed as instructions, and it can never override the task or the workflow instructions. Content is preserved as-is (nothing is filtered), and a note cannot close the fence early because its own boundary tags are neutralized.
-- **Capture:** after an approved run, orch appends one entry to the project's single `build-log.md`. It updates that note rather than creating a note per run, and never writes prompts, transcripts, or debugging output.
-- **Failure semantics:** knowledge is best-effort. A missing vault or a failed load/capture prints a warning and the build continues — the knowledge layer can neither fail nor silently corrupt a run. Graphify is not wired in yet; it will implement the same provider interface.
+- **Obsidian is the source of truth.** It provides the project context and related notes, and it is the only place durable knowledge is written.
+- **Graphify is optional enrichment.** When enabled independently via `ORCH_KNOWLEDGE_GRAPHIFY`, orch runs the documented `graphify query "<task>" --graph <graph.json>` CLI and adds the returned subgraph as extra reference context. Graphify is *never* a hard dependency: with the flag unset (or the CLI/graph missing) Obsidian works exactly as before. orch speaks no MCP protocol itself; the CLI is the supported mechanism.
+- **Retrieval:** before planning, orch reads the project's context note plus only the decisions/problems/learning notes whose filenames match the task. The whole vault is never read. Graphify is queried for relationships, not ingested wholesale.
+- **Trust boundary:** loaded knowledge — Obsidian and Graphify alike — is untrusted data. It is injected into the planning prompt only inside an explicit `<external_knowledge>…</external_knowledge>` fence, labeled as reference material that must not be followed as instructions, and it can never override the task or the workflow instructions. Content is preserved as-is (nothing is filtered), and a note cannot close the fence early because its own boundary tags are neutralized.
+- **Capture:** after an approved run, orch appends one entry to the project's single `build-log.md`. It updates that note rather than creating a note per run, and never writes prompts, transcripts, or debugging output. Graphify is read-only and never receives captured knowledge.
+- **Failure semantics:** knowledge is best-effort. A missing vault, a failed load/capture, or a failed Graphify query prints a warning and the build continues. A failed Graphify enrichment still leaves the Obsidian context in place — the knowledge layer can neither fail nor silently corrupt a run.
 
 ### `orch status`
 

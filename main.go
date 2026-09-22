@@ -227,10 +227,12 @@ Knowledge
   With --knowledge, orch loads relevant context before the run and records the
   approved outcome afterwards. It is off by default and never required. The
   backend is configured by environment:
-    ORCH_KNOWLEDGE_VAULT    path to an Obsidian vault (required to enable)
-    ORCH_KNOWLEDGE_PROJECT  project folder under 01-Projects/ (default: repo dir name)
-  Knowledge problems are warnings: a failure to load or capture never fails the
-  build.
+    ORCH_KNOWLEDGE_VAULT     path to an Obsidian vault (required to enable)
+    ORCH_KNOWLEDGE_PROJECT   project folder under 01-Projects/ (default: repo dir name)
+    ORCH_KNOWLEDGE_GRAPHIFY  truthy to add the read-only Graphify enrichment layer
+    ORCH_KNOWLEDGE_GRAPH     graph.json to query (default: <vault>/graphify-out/graph.json)
+  Obsidian is the source of truth; Graphify only enriches context. Knowledge
+  problems are warnings: a failure to load or capture never fails the build.
 
 Status and logs
   orch status lists each run under .orch/ with its stage count, the verdict

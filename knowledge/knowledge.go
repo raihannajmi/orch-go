@@ -61,15 +61,60 @@ func (Noop) Close() error { return nil }
 
 // Config selects and configures a provider.
 type Config struct {
-	Vault   string // absolute path to an Obsidian vault root
-	Project string // project folder name under 01-Projects/
+	Vault    string          // absolute path to an Obsidian vault root
+	Project  string          // project folder name under 01-Projects/
+	Graphify *GraphifyConfig // nil disables the optional Graphify enrichment layer
 }
 
 // Open returns the provider for cfg. An empty vault yields Noop, so a partially
 // configured request needs no special casing by the caller.
+//
+// Obsidian is always the source of truth. When Graphify is configured it is
+// wrapped around Obsidian as a read-only enricher, never as a replacement.
 func Open(cfg Config) Provider {
 	if cfg.Vault == "" {
 		return Noop{}
 	}
-	return &Obsidian{Vault: cfg.Vault, Project: cfg.Project}
+	primary := Provider(&Obsidian{Vault: cfg.Vault, Project: cfg.Project})
+	if cfg.Graphify == nil {
+		return primary
+	}
+	return &Composite{Primary: primary, Enricher: NewGraphify(*cfg.Graphify)}
+}
+
+// Composite pairs a primary provider (Obsidian, the source of truth) with an
+// optional enricher (Graphify).
+//
+// Load merges their context. A failed primary fails the load; a failed enricher
+// does not — its error is returned alongside the primary's documents, so a
+// broken enricher cannot take Obsidian down with it. Capture only ever reaches
+// the primary, so durable knowledge keeps going to Obsidian.
+type Composite struct {
+	Primary  Provider
+	Enricher Provider
+}
+
+// Load returns the primary's documents plus any the enricher adds. The enricher
+// error is reported separately so the caller can warn without losing context.
+func (c *Composite) Load(ctx context.Context, req Request) ([]Document, error) {
+	docs, err := c.Primary.Load(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	extra, err := c.Enricher.Load(ctx, req)
+	return append(docs, extra...), err
+}
+
+// Capture writes durable knowledge to the primary provider only.
+func (c *Composite) Capture(ctx context.Context, res Result) error {
+	return c.Primary.Capture(ctx, res)
+}
+
+// Close closes both providers, preferring to report the primary's error.
+func (c *Composite) Close() error {
+	err := c.Primary.Close()
+	if cerr := c.Enricher.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

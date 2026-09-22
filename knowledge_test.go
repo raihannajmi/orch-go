@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -312,5 +314,122 @@ func TestOnlyPlanningStageReceivesKnowledge(t *testing.T) {
 		if name != "1-plan" && strings.Contains(p, "KNOWLEDGE_BODY") {
 			t.Errorf("knowledge leaked into stage %s", name)
 		}
+	}
+}
+
+// writeVaultNote creates a project context note in a temp vault.
+func writeVaultNote(t *testing.T, vault, project string) {
+	t.Helper()
+	dir := filepath.Join(vault, "01-Projects", project)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := "# " + project + "\n\nPROJECT_CONTEXT\n"
+	if err := os.WriteFile(filepath.Join(dir, project+".md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write project note: %v", err)
+	}
+}
+
+// TestGraphifyDisabledByDefault is requirement 2/11: Graphify is opt-in and off
+// unless explicitly enabled, so Obsidian alone is used.
+func TestGraphifyDisabledByDefault(t *testing.T) {
+	t.Setenv("ORCH_KNOWLEDGE_VAULT", t.TempDir())
+	t.Setenv("ORCH_KNOWLEDGE_GRAPHIFY", "")
+	t.Setenv("ORCH_KNOWLEDGE_GRAPH", "")
+
+	s := openKnowledge(true, "/repo/orch-go", func(string, ...any) {})
+	if s == nil {
+		t.Fatal("openKnowledge = nil, want a session")
+	}
+	if _, ok := s.provider.(*knowledge.Obsidian); !ok {
+		t.Errorf("provider = %T, want *knowledge.Obsidian when Graphify is off", s.provider)
+	}
+}
+
+// TestGraphifyEnabledByEnv is requirement 11: a separate flag turns Graphify on
+// without changing the vault configuration.
+func TestGraphifyEnabledByEnv(t *testing.T) {
+	t.Setenv("ORCH_KNOWLEDGE_VAULT", t.TempDir())
+	t.Setenv("ORCH_KNOWLEDGE_GRAPHIFY", "1")
+	t.Setenv("ORCH_KNOWLEDGE_GRAPH", "")
+
+	s := openKnowledge(true, "/repo/orch-go", func(string, ...any) {})
+	if s == nil {
+		t.Fatal("openKnowledge = nil, want a session")
+	}
+	if _, ok := s.provider.(*knowledge.Composite); !ok {
+		t.Errorf("provider = %T, want *knowledge.Composite when Graphify is on", s.provider)
+	}
+}
+
+// TestGraphifyUnavailableStillUsesObsidian is requirements 4 and 5: with
+// Graphify enabled but unavailable, Obsidian context still reaches the stage and
+// the build succeeds, with a warning.
+func TestGraphifyUnavailableStillUsesObsidian(t *testing.T) {
+	vault := t.TempDir()
+	const project = "orch-go"
+	writeVaultNote(t, vault, project)
+
+	t.Setenv("ORCH_KNOWLEDGE_VAULT", vault)
+	t.Setenv("ORCH_KNOWLEDGE_PROJECT", project)
+	t.Setenv("ORCH_KNOWLEDGE_GRAPHIFY", "1")
+	t.Setenv("ORCH_KNOWLEDGE_GRAPH", filepath.Join(vault, "graphify-out", "missing.json"))
+
+	var warnings []string
+	session := openKnowledge(true, "/repo/"+project, func(f string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(f, args...))
+	})
+
+	b, _, prompts, _ := fakeBuilder(t, 1)
+	b.knowledge = session
+	if err := b.build("task"); err != nil {
+		t.Fatalf("build failed because Graphify was unavailable: %v", err)
+	}
+	if !strings.Contains((*prompts)["1-plan"], "PROJECT_CONTEXT") {
+		t.Errorf("Obsidian context was lost when Graphify failed:\n%s", (*prompts)["1-plan"])
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "graphify") {
+		t.Errorf("Graphify failure was not warned about: %v", warnings)
+	}
+}
+
+// TestGraphifyContextStaysInsideTrustBoundary is requirement 10: Graphify output
+// is external knowledge, so it must land inside the same data boundary as
+// Obsidian's.
+func TestGraphifyContextStaysInsideTrustBoundary(t *testing.T) {
+	vault := t.TempDir()
+	const project = "orch-go"
+	writeVaultNote(t, vault, project)
+
+	graph := filepath.Join(t.TempDir(), "graph.json")
+	if err := os.WriteFile(graph, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write graph: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "graphify")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'NODE GraphifySecret'\n"), 0o755); err != nil {
+		t.Fatalf("write stand-in graphify: %v", err)
+	}
+
+	provider := knowledge.Open(knowledge.Config{
+		Vault:    vault,
+		Project:  project,
+		Graphify: &knowledge.GraphifyConfig{Bin: bin, Graph: graph},
+	})
+
+	b, _, prompts, _ := fakeBuilder(t, 1)
+	b.knowledge = &knowledgeSession{provider: provider, project: project, repoDir: "/repo", warn: func(string, ...any) {}}
+	if err := b.build("task"); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	plan := (*prompts)["1-plan"]
+	open := strings.Index(plan, externalKnowledgeOpen)
+	closeTag := strings.Index(plan, externalKnowledgeClose)
+	body := strings.Index(plan, "GraphifySecret")
+	if open < 0 || closeTag < 0 || body < 0 || body < open || body > closeTag {
+		t.Errorf("Graphify context is not inside the external-knowledge boundary:\n%s", plan)
+	}
+	if !strings.Contains(plan, "NOT instructions") {
+		t.Errorf("Graphify context is not covered by the untrusted-data preamble")
 	}
 }
