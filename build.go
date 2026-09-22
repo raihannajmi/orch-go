@@ -107,11 +107,21 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		}
 	}
 
-	runDir := filepath.Join(absDir, buildStateDir, time.Now().Format("20060102-150405"))
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	// Create the run directory collision-safely and lock it before touching it,
+	// so a second build in the same second can never race this one into the same
+	// directory. The lock is held for the whole run.
+	stateDir := filepath.Join(absDir, buildStateDir)
+	runID, runDir, err := createRunDir(stateDir)
+	if err != nil {
 		fmt.Fprintf(stderr, "orch: %v\n", err)
 		return 1
 	}
+	lock, err := lockRun(runDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
+	}
+	defer func() { _ = lock.Close() }()
 
 	b := &builder{
 		dir:    absDir,
@@ -123,6 +133,22 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	b.verify = b.verifyRepo
 	if b.knowledge = openKnowledge(opts.knowledge, absDir, b.logf); b.knowledge != nil {
 		defer b.knowledge.close()
+	}
+	b.state = &runState{
+		Version:      runStateVersion,
+		ID:           runID,
+		Task:         opts.task,
+		RepoDir:      absDir,
+		CreatedAt:    time.Now().Format(time.RFC3339),
+		StageTimeout: formatStageTimeout(opts.stageTimeout),
+		Knowledge:    opts.knowledge,
+		Status:       runStateRunning,
+		Stages:       []stageState{},
+		BaseCommit:   gitBaseCommit(absDir),
+	}
+	if err := writeRunState(runDir, *b.state); err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
 	}
 
 	b.logf("artifacts: %s", runDir)
@@ -212,6 +238,13 @@ type builder struct {
 	// so an absent layer never changes the workflow.
 	knowledge *knowledgeSession
 
+	// state is the persisted run state. Nil disables persistence, which keeps the
+	// workflow's sequencing testable without a run directory.
+	state *runState
+	// resumeFrom is the number of leading stages a resumed run replays from disk
+	// instead of launching. Zero is a fresh run that executes every stage.
+	resumeFrom int
+
 	n int // stage counter, used to number artifacts
 }
 
@@ -226,20 +259,188 @@ func (b *builder) artifactPath(label string) (name, path string) {
 	return name, filepath.Join(b.runDir, name+".md")
 }
 
+// run executes one stage, or — on a resumed run — replays a stage that already
+// completed by reading its artifact back from disk, so the workflow re-enters at
+// exactly the stage it left off without re-launching an agent. Every transition
+// is persisted.
 func (b *builder) run(agentName, name, prompt string) (string, error) {
+	if index := b.n - 1; index < b.resumeFrom {
+		text, err := b.replay(name)
+		if err != nil {
+			return "", err
+		}
+		b.logf("stage %s: replaying completed artifact", name)
+		b.completeStage(name)
+		return text, nil
+	}
+
 	b.logf("stage %s: %s", name, agentName)
+	b.beginStage(name, agentName)
 	text, err := b.stage(agentName, name, prompt)
 	if err != nil {
+		b.failStage(name, err)
 		return "", fmt.Errorf("stage %s (%s): %w", name, agentName, err)
 	}
+	b.completeStage(name)
 	return text, nil
 }
 
-// build performs the full plan → review → implement → review → fix workflow and
-// ends with verification. The implementation is accepted only when a review
+// replay returns a completed stage's artifact from disk with the completion
+// marker stripped, exactly as the live stage would have returned it.
+func (b *builder) replay(name string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(b.runDir, name+".md"))
+	if err != nil {
+		return "", fmt.Errorf("resume: completed stage %s has no readable artifact: %w", name, err)
+	}
+	return stripStageMarker(string(raw)), nil
+}
+
+// saveState persists run.json. A nil state (the unit-test builder) disables
+// persistence so the workflow's sequencing stays testable on its own.
+func (b *builder) saveState() {
+	if b.state == nil {
+		return
+	}
+	if err := writeRunState(b.runDir, *b.state); err != nil {
+		b.logf("state: %v", err)
+	}
+}
+
+// findStage returns the recorded stage with the given name, or nil.
+func (b *builder) findStage(name string) *stageState {
+	for i := range b.state.Stages {
+		if b.state.Stages[i].Name == name {
+			return &b.state.Stages[i]
+		}
+	}
+	return nil
+}
+
+// stageByNumber returns the recorded stage whose workflow number is n, or nil.
+// The number is the stage's own `n-` prefix, so a stage's position comes from
+// the workflow, not from where it happens to sit in the slice.
+func (b *builder) stageByNumber(n int) *stageState {
+	for i := range b.state.Stages {
+		if stageNumber(b.state.Stages[i].Name) == n {
+			return &b.state.Stages[i]
+		}
+	}
+	return nil
+}
+
+// recomputeLastCompleted sets LastCompleted to the workflow position of the last
+// stage that completed: the length of the contiguous run of completed stages
+// starting at stage 1. A running or failed stage halts the count even when later
+// stage records exist, so the cursor never advances past an incomplete stage.
+// It is derived from the stages' own numbering and status, never from the number
+// of records.
+func (b *builder) recomputeLastCompleted() {
+	b.state.LastCompleted = 0
+	for n := 1; ; n++ {
+		s := b.stageByNumber(n)
+		if s == nil || s.Status != stageCompleted {
+			return
+		}
+		b.state.LastCompleted = n
+	}
+}
+
+// beginStage records a stage as running before it launches. Re-running a stage
+// that had completed rewinds the progress cursor to just before it.
+func (b *builder) beginStage(name, agent string) {
+	if b.state == nil {
+		return
+	}
+	if s := b.findStage(name); s != nil {
+		s.Agent, s.Status = agent, stageRunning
+	} else {
+		b.state.Stages = append(b.state.Stages, stageState{
+			Name: name, Agent: agent, Artifact: name + ".md", Status: stageRunning,
+		})
+	}
+	b.recomputeLastCompleted()
+	b.saveState()
+}
+
+// completeStage records a stage as complete and advances the progress cursor.
+func (b *builder) completeStage(name string) {
+	if b.state == nil {
+		return
+	}
+	if s := b.findStage(name); s != nil {
+		s.Status = stageCompleted
+	} else {
+		b.state.Stages = append(b.state.Stages, stageState{
+			Name: name, Artifact: name + ".md", Status: stageCompleted,
+		})
+	}
+	b.recomputeLastCompleted()
+	b.saveState()
+}
+
+// failStage records why a stage did not complete. The progress cursor is left at
+// the last stage that actually completed, so a failed or timed-out stage never
+// counts as progress.
+func (b *builder) failStage(name string, cause error) {
+	if b.state == nil {
+		return
+	}
+	if s := b.findStage(name); s != nil {
+		s.Status = stageFailed
+		if errors.Is(cause, errStageTimeout) {
+			s.Status = stageTimedOut
+		}
+	}
+	b.recomputeLastCompleted()
+	b.saveState()
+}
+
+// setVerify records the final verification outcome, which verify.log alone does
+// not express.
+func (b *builder) setVerify(result string) {
+	if b.state == nil {
+		return
+	}
+	b.state.VerifyResult = result
+	b.saveState()
+}
+
+// finalize writes the run's terminal state once the workflow returns, so even a
+// failed or timed-out run leaves an explicit outcome in run.json.
+func (b *builder) finalize(err error) {
+	if b.state == nil {
+		return
+	}
+	switch {
+	case err == nil:
+		b.state.Status = runStateCompleted
+		b.state.Error = ""
+	case errors.Is(err, errStageTimeout):
+		b.state.Status = runStateTimedOut
+		b.state.Error = err.Error()
+	default:
+		b.state.Status = runStateFailed
+		b.state.Error = err.Error()
+	}
+	b.saveState()
+}
+
+// build runs the workflow and records its terminal state, so the run has an
+// explicit outcome even when it fails or times out.
+func (b *builder) build(task string) error {
+	if b.state != nil {
+		b.state.Task = task
+	}
+	err := b.workflow(task)
+	b.finalize(err)
+	return err
+}
+
+// workflow performs the full plan → review → implement → review → fix sequence
+// and ends with verification. The implementation is accepted only when a review
 // explicitly approves; otherwise orch runs at most buildPlanCycles cycles and
 // fails without pretending the work is done.
-func (b *builder) build(task string) error {
+func (b *builder) workflow(task string) error {
 	// Load external knowledge before the first stage so the plan can build on it.
 	// Knowledge off (nil session) and a provider failure both yield no context.
 	knowledgeDocs := b.loadKnowledge(task)
@@ -294,8 +495,10 @@ func (b *builder) build(task string) error {
 	}
 
 	if err := b.verify(); err != nil {
+		b.setVerify(verifyFailed)
 		return err
 	}
+	b.setVerify(verifyPassed)
 	// Capture only once the run is approved and verified, so the knowledge layer
 	// records durable outcomes rather than failed attempts.
 	b.captureKnowledge(task)
