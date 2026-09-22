@@ -41,6 +41,8 @@ func orchMain(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return cmdStatus(args[1:], stdout, stderr)
 	case "logs":
 		return cmdLogs(args[1:], stdout, stderr)
+	case "resume":
+		return cmdResume(args[1:], stdin, stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintf(stdout, "orch %s\n", version)
 		return 0
@@ -196,6 +198,7 @@ Usage
   orch build "<task>" [flags]        plan, implement, review and verify a task
   orch status                        show the build runs under .orch/, newest first
   orch logs <run-id>                 list the artifacts of one run
+  orch resume <run-id>               resume an interrupted run from its first incomplete stage
   orch version                       print the orch version
   orch help                          print this message
 
@@ -206,6 +209,7 @@ Examples
   orch build "add a --json flag to the report command"
   orch status
   orch logs 20260101-120000
+  orch resume 20260101-120000
 
 Agents
   agy           Antigravity CLI (native terminal UI)
@@ -240,6 +244,16 @@ Status and logs
   orch logs <run-id> lists that run's Markdown artifacts and raw terminal
   transcripts so you can read or open them; the run id is the directory name
   under .orch/ and the first column of orch status.
+
+Resume
+  orch resume <run-id> re-runs an interrupted or failed run from its first
+  incomplete stage, skipping the stages whose artifacts already end with the
+  completion marker. It refuses when the repository is not safe to resume (HEAD
+  moved since the run started, or an unexpected dirty tree) and never resets,
+  checks out or cleans the working tree. An implement stage that was interrupted
+  is re-run as-is: any changes it already made to the repository are not rolled
+  back. Runs recorded before run.json existed stay readable with status/logs but
+  cannot be resumed.
 
 Agents run one after another, each owning the terminal; if one exits non-zero
 the rest are skipped and orch exits with that code.

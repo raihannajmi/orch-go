@@ -8,6 +8,7 @@ A minimal Go CLI orchestrator that runs coding agents in real pseudo-terminals (
 - **Zero Permission Bypass:** `orch` adds no approval-skipping flags and refuses to forward any bypass flags passed after `--`. Native permission prompts are always preserved and answered interactively.
 - **Sequential Execution:** Agents run one after another, each owning the terminal. If an agent exits with a non-zero code, subsequent agents are skipped and `orch` halts immediately with that code.
 - **Liveness Watchdog:** Each build stage has a configurable timeout. A stage that stops making progress is terminated cleanly and the run stops there instead of waiting forever.
+- **Optional Knowledge Layer:** Best-effort context retrieval and durable capture (Obsidian, Graphify) that never breaks a build or bypasses permissions.
 
 ## Prerequisites & Building
 
@@ -105,6 +106,7 @@ Executes an automated multi-stage build workflow combining planning, plan review
 **Flags:**
 - `-C, --dir <path>`: Repository directory where agents work (default: current directory).
 - `--stage-timeout <duration>`: End a stage that makes no progress for this long, e.g. `--stage-timeout 45m` (default `30m`; `0` disables the watchdog).
+- `--knowledge`: Load relevant context before planning and capture durable outcomes after approved runs (see below).
 
 **Stage Completion Signal:**
 Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
