@@ -17,24 +17,48 @@ type runInfo struct {
 	stages   int    // number of Markdown stage artifacts
 	verdict  string // outcome of the last review, or "-" when there is none
 	timedOut string // stage the watchdog ended, or "" when the run never timed out
+	state    *runState
 }
 
 // cmdStatus lists the workflow runs under .orch/, newest first.
 func cmdStatus(args []string, stdout, stderr io.Writer) int {
-	if len(args) > 0 {
-		if args[0] == "-h" || args[0] == "--help" {
+	asJSON := jsonRequested(args)
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help":
 			usage(stdout)
 			return 0
+		case "--json":
+		default:
+			return cliError("status", asJSON, stdout, stderr, 2, "unknown argument %q for status", arg)
 		}
-		fmt.Fprintln(stderr, "orch: status takes no arguments")
-		return 2
 	}
 
 	runs, err := listRuns(buildStateDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("status", asJSON, stdout, stderr, 1, "%v", err)
 	}
+
+	if asJSON {
+		out := make([]jsonRun, 0, len(runs))
+		for _, r := range runs {
+			jr := jsonRun{ID: r.id, Stages: r.stages, Verdict: r.verdict, TimedOut: r.timedOut}
+			if r.state != nil {
+				jr.Status = r.state.Status
+				jr.LastCompleted = r.state.LastCompleted
+				jr.VerifyResult = r.state.VerifyResult
+				jr.Failure = r.state.Failure
+				jr.ExitCode = r.state.ExitCode
+			}
+			out = append(out, jr)
+		}
+		if err := emitJSON(stdout, statusResponse{jsonHeader{Command: "status", OK: true}, out}); err != nil {
+			fmt.Fprintf(stderr, "orch: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	if len(runs) == 0 {
 		fmt.Fprintf(stdout, "orch: no runs under %s yet; start one with `orch build \"<task>\"`\n", buildStateDir)
 		return 0
@@ -87,6 +111,11 @@ func readRun(dir, id string) (runInfo, error) {
 	}
 
 	r := runInfo{id: id, verdict: "-"}
+	// run.json, when present, carries the richer terminal state; a legacy run
+	// without it stays fully readable and is simply missing those fields.
+	if st, err := readRunState(dir); err == nil {
+		r.state = &st
+	}
 	lastReview := -1
 	for _, e := range entries {
 		name := e.Name()
@@ -122,43 +151,57 @@ func readRun(dir, id string) (runInfo, error) {
 // cmdLogs lists the artifacts a single run wrote: the Markdown reports and the
 // raw terminal transcripts recorded alongside them.
 func cmdLogs(args []string, stdout, stderr io.Writer) int {
+	asJSON := jsonRequested(args)
 	var id string
 	for _, arg := range args {
 		switch {
 		case arg == "-h" || arg == "--help":
 			usage(stdout)
 			return 0
+		case arg == "--json":
 		case strings.HasPrefix(arg, "-") && arg != "-":
-			fmt.Fprintf(stderr, "orch: unknown flag %q for logs\n", arg)
-			return 2
+			return cliError("logs", asJSON, stdout, stderr, 2, "unknown flag %q for logs", arg)
 		case id == "":
 			id = arg
 		default:
-			fmt.Fprintln(stderr, "orch: logs takes a single run id")
-			return 2
+			return cliError("logs", asJSON, stdout, stderr, 2, "logs takes a single run id")
 		}
 	}
 	if id == "" {
-		fmt.Fprintln(stderr, "orch: logs needs a run id, e.g. orch logs 20260101-120000")
-		return 2
+		return cliError("logs", asJSON, stdout, stderr, 2, "logs needs a run id, e.g. orch logs 20260101-120000")
 	}
 	if err := validRunID(id); err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 2
+		return cliError("logs", asJSON, stdout, stderr, 2, "%v", err)
 	}
 
 	runDir := filepath.Join(buildStateDir, id)
 	info, err := os.Stat(runDir)
 	if err != nil || !info.IsDir() {
-		fmt.Fprintf(stderr, "orch: unknown run %q (see `orch status`)\n", id)
-		return 2
+		return cliError("logs", asJSON, stdout, stderr, 2, "unknown run %q (see `orch status`)", id)
 	}
 
 	arts, err := runArtifacts(runDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("logs", asJSON, stdout, stderr, 1, "%v", err)
 	}
+
+	if asJSON {
+		resp := logsResponse{
+			jsonHeader: jsonHeader{Command: "logs", OK: true},
+			RunID:      id,
+			RunDir:     runDir,
+			Artifacts:  []jsonArtifact{},
+		}
+		for _, a := range arts {
+			resp.Artifacts = append(resp.Artifacts, jsonArtifact{Name: a.name, Size: a.size})
+		}
+		if err := emitJSON(stdout, resp); err != nil {
+			fmt.Fprintf(stderr, "orch: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	if len(arts) == 0 {
 		fmt.Fprintf(stdout, "orch: run %s has no artifacts\n", id)
 		return 0

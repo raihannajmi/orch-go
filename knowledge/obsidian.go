@@ -225,5 +225,5 @@ func buildLogEntry(res Result) string {
 		task = strings.ToValidUTF8(task[:maxTaskBytes], "") + "…"
 	}
 	return fmt.Sprintf("## %s — %s\n\n- Run: `%s`\n- Result: APPROVED\n\n",
-		time.Now().Format("2006-01-02"), task, filepath.Base(res.RunDir))
+		time.Now().UTC().Format("2006-01-02"), task, filepath.Base(res.RunDir))
 }

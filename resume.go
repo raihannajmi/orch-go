@@ -17,45 +17,40 @@ import (
 // normal interactive session with native permission prompts — orch adds no
 // bypass flags and runs nothing headless.
 func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
+	asJSON := jsonRequested(args)
 	var id string
 	for _, arg := range args {
 		switch {
 		case arg == "-h" || arg == "--help":
 			usage(stdout)
 			return 0
+		case arg == "--json":
 		case strings.HasPrefix(arg, "-") && arg != "-":
-			fmt.Fprintf(stderr, "orch: unknown flag %q for resume\n", arg)
-			return 2
+			return cliError("resume", asJSON, stdout, stderr, 2, "unknown flag %q for resume", arg)
 		case id == "":
 			id = arg
 		default:
-			fmt.Fprintln(stderr, "orch: resume takes a single run id")
-			return 2
+			return cliError("resume", asJSON, stdout, stderr, 2, "resume takes a single run id")
 		}
 	}
 	if id == "" {
-		fmt.Fprintln(stderr, "orch: resume needs a run id, e.g. orch resume 20260101-120000")
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "resume needs a run id, e.g. orch resume 20260101-120000")
 	}
 	if err := validRunID(id); err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "%v", err)
 	}
 
 	runDir := filepath.Join(buildStateDir, id)
 	if info, err := os.Stat(runDir); err != nil || !info.IsDir() {
-		fmt.Fprintf(stderr, "orch: unknown run %q (see `orch status`)\n", id)
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "unknown run %q (see `orch status`)", id)
 	}
 
 	st, err := readRunState(runDir)
 	if errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintf(stderr, "orch: run %s predates resume support (no %s); it stays readable with `orch status`/`orch logs` but cannot be resumed\n", id, runStateFile)
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "run %s predates resume support (no %s); it stays readable with `orch status`/`orch logs` but cannot be resumed", id, runStateFile)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 	}
 
 	// Serialize whole workflows per repository, exactly as `orch build` does, and
@@ -64,12 +59,10 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	stateDir := filepath.Dir(runDir)
 	workflowLock, err := lockWorkflow(stateDir)
 	if errors.Is(err, errRunLocked) {
-		fmt.Fprintf(stderr, "orch: another orch workflow is already running in this repository; refusing to resume %s concurrently\n", id)
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "another orch workflow is already running in this repository; refusing to resume %s concurrently", id)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	defer func() { _ = workflowLock.Close() }()
 
@@ -78,16 +71,21 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// proof the previous process died, i.e. the run was interrupted.
 	lock, err := lockRun(runDir)
 	if errors.Is(err, errRunLocked) {
-		fmt.Fprintf(stderr, "orch: run %s is already in progress; refusing to resume it concurrently\n", id)
-		return 2
+		return cliError("resume", asJSON, stdout, stderr, 2, "run %s is already in progress; refusing to resume it concurrently", id)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	defer func() { _ = lock.Close() }()
 
 	if st.Status == runStateCompleted {
+		if asJSON {
+			if err := emitJSON(stdout, newRunResponse("resume", runDir, &st, 0, nil)); err != nil {
+				fmt.Fprintf(stderr, "orch: %v\n", err)
+				return 1
+			}
+			return 0
+		}
 		fmt.Fprintf(stdout, "orch: run %s is already complete; nothing to resume\n", id)
 		return 0
 	}
@@ -95,8 +93,7 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		st.Status = runStateInterrupted
 		st.Error = "interrupted: the orchestrating process ended mid-run"
 		if err := writeRunState(runDir, st); err != nil {
-			fmt.Fprintf(stderr, "orch: %v\n", err)
-			return 1
+			return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 		}
 		fmt.Fprintf(stderr, "orch: run %s was interrupted; resuming from the first incomplete stage\n", id)
 	}
@@ -107,18 +104,15 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	resumeFrom := firstIncompleteStage(runDir, st)
 	if resumeFrom == len(st.Stages) && st.VerifyResult != verifyFailed && len(st.Stages) > 0 {
 		if st.Error != "" {
-			fmt.Fprintf(stderr, "orch: run %s has no incomplete stage to resume (status %s: %s)\n", id, st.Status, st.Error)
-		} else {
-			fmt.Fprintf(stderr, "orch: run %s has no incomplete stage to resume (status %s)\n", id, st.Status)
+			return cliError("resume", asJSON, stdout, stderr, 1, "run %s has no incomplete stage to resume (status %s: %s)", id, st.Status, st.Error)
 		}
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "run %s has no incomplete stage to resume (status %s)", id, st.Status)
 	}
 
 	// The repository must be safe to continue in. orch never resets, checks out
 	// or cleans: it refuses instead of disturbing the user's work.
 	if warn, err := checkResumeSafe(st.RepoDir, st.BaseCommit, repoMutatedByRun(st)); err != nil {
-		fmt.Fprintf(stderr, "orch: cannot resume run %s: %v\n", id, err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "cannot resume run %s: %v", id, err)
 	} else if warn != "" {
 		fmt.Fprintf(stderr, "orch: warning: %s\n", warn)
 	}
@@ -132,16 +126,22 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// same thing the original run would have.
 	verifySpecs, err := resumeVerifySpecs(st)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: cannot resume run %s: %v\n", id, err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "cannot resume run %s: %v", id, err)
+	}
+
+	// Under --json the interactive agents' terminal output goes to stderr, so
+	// stdout carries only the final JSON document.
+	agentOut := stdout
+	if asJSON {
+		agentOut = stderr
 	}
 
 	b := &builder{
 		dir:         st.RepoDir,
 		runDir:      runDir,
-		stdout:      stdout,
+		stdout:      agentOut,
 		stderr:      stderr,
-		stage:       interactiveStage(st.RepoDir, runDir, stdin, stdout, parseStateTimeout(st.StageTimeout)),
+		stage:       interactiveStage(st.RepoDir, runDir, stdin, agentOut, parseStateTimeout(st.StageTimeout)),
 		state:       &st,
 		resumeFrom:  resumeFrom,
 		verifySpecs: verifySpecs,
@@ -154,12 +154,23 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	st.Status = runStateRunning
 	st.Error = ""
 	if err := writeRunState(runDir, st); err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 	}
 
-	if err := b.build(st.Task); err != nil {
-		fmt.Fprintf(stderr, "orch: resume: %v\n", err)
+	buildErr := b.build(st.Task)
+	if asJSON {
+		code := 0
+		if buildErr != nil {
+			code = 1
+		}
+		if err := emitJSON(stdout, newRunResponse("resume", runDir, &st, code, buildErr)); err != nil {
+			fmt.Fprintf(stderr, "orch: %v\n", err)
+			return 1
+		}
+		return code
+	}
+	if buildErr != nil {
+		fmt.Fprintf(stderr, "orch: resume: %v\n", buildErr)
 		return 1
 	}
 	fmt.Fprintf(stdout, "orch: resumed run %s to completion; artifacts in %s\n", id, runDir)

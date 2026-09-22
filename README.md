@@ -136,6 +136,41 @@ Only one mutating workflow runs against a repository at a time. `orch build` and
 
 Runtime artifacts under `.orch/` are owner-only: the `.orch` directory and new run directories are `0700`, and the state (`run.json`), lock files, transcripts (`.log`), stage artifacts (`.md`) and `verify.log` are `0600`. This keeps prompts, transcripts and agent output private on shared machines. Existing artifacts are never re-permissioned, and `status`/`logs` keep reading runs created before this change.
 
+### Machine-readable output (`--json`)
+
+`orch list`, `orch status`, `orch logs <run-id>`, `orch build` and `orch resume` accept `--json`. With it, orch writes **exactly one JSON document to stdout and nothing else there**; interactive agent output, progress and diagnostics all go to stderr, so `stdout` is valid JSON a pipe can consume. Exit codes are unchanged. `orch run` is interactive and has no `--json`.
+
+Every document carries a common envelope, and errors are a stable object:
+
+```json
+{ "command": "status", "ok": true,  "runs": [ ... ] }
+{ "command": "build",  "ok": false, "error": { "code": 1, "message": "verification failed: ..." },
+  "run": { "id": "20260922-100305", "status": "failed", "failure": "verify",
+           "verifyResult": "failed", "stages": [ ... ] } }
+```
+
+- `list` → `agents[]` (`name`, `installed`, `summary`).
+- `status` → `runs[]` (`id`, `stages`, `verdict`, `timedOut`, and, when the run has `run.json`, `status`, `lastCompleted`, `verifyResult`, `failure`, `exitCode`).
+- `logs` → `runId`, `runDir`, `artifacts[]` (`name`, `size`).
+- `build`/`resume` → `run` (`id`, `dir`, `status`, `failure`, `exitCode`, `verifyResult`, `stages[]`).
+
+The task text is deliberately **not** included, and no transcripts are inlined: JSON output never leaks prompts or agent output.
+
+```sh
+orch status --json | jq '.runs[0].status'
+orch build "add a flag" --json --verify "make test"
+```
+
+### Limits: transcripts and large prompts
+
+A stage transcript (`<stage>.log`) and `verify.log` are capped at 64 MiB and, when the cap is hit, end with an explicit `[orch: transcript truncated ...]` notice — truncation is never silent. Set `ORCH_MAX_LOG_BYTES` to change the cap (`0` or `unlimited` disables it). The stage Markdown artifacts (which carry the completion marker) are written by the agent to a different file and are **never** truncated, so a bounded transcript cannot break the workflow. Live terminal output is not capped.
+
+Prompts and forwarded arguments reach the agent as command-line arguments, which the OS bounds (Linux `MAX_ARG_STRLEN` is 128 KiB). orch checks the assembled command line before exec and refuses an oversized one with an actionable error — it never silently truncates your task — and a kernel `E2BIG` is reported as a clear message rather than a raw crash.
+
+### Timestamps and failure classification
+
+Run ids are UTC timestamps (`YYYYMMDD-HHMMSS`) and the persisted `createdAt` is RFC3339 UTC, so ordering and identity are timezone-independent; existing local-time run ids remain readable. When a run ends, `run.json` records a machine-readable `failure` kind — `agent`, `timeout`, `verify`, `state` or `workflow` — plus the agent's `exitCode` when an agent exited non-zero, so an agent failure is never confused with an orch internal error or a failed verification. These surface in `status --json` and `build`/`resume --json`.
+
 **Stage Completion Signal:**
 Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
 
@@ -231,7 +266,7 @@ Prints CLI usage instructions, agent registry summaries, and flag references.
 | Exit Code | Meaning |
 |---|---|
 | `0` | Success (or help/version requested). |
-| `1` | PTY or runtime error, or stage / verification failure during `orch build`. |
+| `1` | PTY or runtime error, or stage / verification failure during `orch build`. `run.json` and `--json` classify it (`agent`, `timeout`, `verify`, `state`, `workflow`). |
 | `2` | Command-line usage error, unknown command or agent, missing flag argument, or multiple agents specified with `--` pass-through args. (`orch` with no arguments prints usage to `stderr` and exits with `2`). |
 | `127` | Required agent binary not found on `$PATH`. |
 | `>0` / `128+N` | Exit status propagated directly from the agent process, following standard shell conventions (or `128 + signal` if killed by signal). |

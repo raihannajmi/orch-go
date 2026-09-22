@@ -32,7 +32,7 @@ func orchMain(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 
 	switch args[0] {
 	case "list", "ls":
-		return listAgents(stdout)
+		return cmdList(args[1:], stdout, stderr)
 	case "run":
 		return cmdRun(args[1:], stdin, stdout, stderr)
 	case "build":
@@ -181,6 +181,35 @@ func flagValue(args []string, i int, name, value string, hasValue bool) (string,
 	return args[i+1], i + 1, nil
 }
 
+// cmdList prints the agent registry, human-readable or as JSON.
+func cmdList(args []string, stdout, stderr io.Writer) int {
+	asJSON := jsonRequested(args)
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help":
+			usage(stdout)
+			return 0
+		case "--json":
+		default:
+			return cliError("list", asJSON, stdout, stderr, 2, "unknown argument %q for list", arg)
+		}
+	}
+	if !asJSON {
+		return listAgents(stdout)
+	}
+
+	list := make([]jsonAgent, 0, len(agents))
+	for _, a := range agents {
+		_, err := exec.LookPath(a.Bin)
+		list = append(list, jsonAgent{Name: a.Name, Installed: err == nil, Summary: a.Summary})
+	}
+	if err := emitJSON(stdout, listResponse{jsonHeader{Command: "list", OK: true}, list}); err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 // listAgents prints the registry with installation status.
 func listAgents(stdout io.Writer) int {
 	width := 0
@@ -235,6 +264,21 @@ Flags for build
   --stage-timeout <d>  end a stage that makes no progress for <d> (default 30m, 0 disables)
   --verify <command>   verification command to run at the end (repeatable; default: auto-detect)
   --knowledge          load and capture durable knowledge (see Knowledge below)
+  --json               emit one JSON document on stdout instead of human output
+
+Machine-readable output
+  --json makes list, status, logs, build and resume write exactly one JSON
+  document to stdout and nothing else there; interactive agent output and every
+  diagnostic go to stderr. Errors are a stable {"code","message"} object inside
+  the document, and the exit code is unchanged. orch run is interactive and
+  has no --json. Run ids and persisted timestamps are UTC (RFC3339 for state).
+
+Limits
+  A stage transcript (<stage>.log) and verify.log are capped at 64 MiB and end
+  with an explicit truncation notice; set ORCH_MAX_LOG_BYTES to change the cap
+  (0 or "unlimited" disables it). The stage Markdown artifacts are never
+  truncated. A prompt that would exceed the OS argument limit is refused with a
+  clear error rather than crashing at exec.
 
 Knowledge
   With --knowledge, orch loads relevant context before the run and records the
@@ -263,7 +307,8 @@ Status and logs
   of its final review, and the stage a watchdog ended if the run timed out.
   orch logs <run-id> lists that run's Markdown artifacts and raw terminal
   transcripts so you can read or open them; the run id is the directory name
-  under .orch/ and the first column of orch status.
+  under .orch/ and the first column of orch status. The run id is a UTC
+  timestamp (YYYYMMDD-HHMMSS).
 
 Resume
   orch resume <run-id> re-runs an interrupted or failed run from its first

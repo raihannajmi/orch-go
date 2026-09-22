@@ -67,21 +67,30 @@ type buildOptions struct {
 	stageTimeout time.Duration // per-stage watchdog; 0 disables it
 	knowledge    bool          // load/capture durable knowledge (opt-in)
 	verify       []string      // --verify commands, in order; empty means auto-detect
+	json         bool          // emit one machine-readable JSON document on stdout
 }
 
 func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
+	// --json is detected before parsing so that even a usage error is reported as
+	// a JSON document when the operator asked for machine-readable output.
+	asJSON := jsonRequested(args)
 	opts, err := parseBuildArgs(args)
 	if errors.Is(err, errHelp) {
 		usage(stdout)
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 2
+		return cliError("build", asJSON, stdout, stderr, 2, "%v", err)
 	}
 	if opts.task == "" {
-		fmt.Fprintln(stderr, `orch: build needs a task, e.g. orch build "add a --json flag"`)
-		return 2
+		return cliError("build", asJSON, stdout, stderr, 2, `build needs a task, e.g. orch build "add a --json flag"`)
+	}
+
+	// Under --json the interactive agents' terminal output and every diagnostic
+	// go to stderr, so stdout carries only the final JSON document.
+	agentOut := stdout
+	if asJSON {
+		agentOut = stderr
 	}
 
 	dir := opts.dir
@@ -90,16 +99,14 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 2
+		return cliError("build", asJSON, stdout, stderr, 2, "%v", err)
 	}
 
 	// Resolve the verification commands before anything runs, so a repository
 	// orch cannot verify fails fast instead of after a full agent workflow.
 	verifySpecs, err := resolveVerify(absDir, opts.verify)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 2
+		return cliError("build", asJSON, stdout, stderr, 2, "%v", err)
 	}
 
 	// Resolve the agents before creating any state, so a missing binary fails
@@ -107,12 +114,10 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	for _, name := range []string{buildPlanAgent, buildReviewAgent} {
 		a, ok := lookupAgent(name)
 		if !ok {
-			fmt.Fprintf(stderr, "orch: agent %q is not registered\n", name)
-			return 2
+			return cliError("build", asJSON, stdout, stderr, 2, "agent %q is not registered", name)
 		}
 		if _, err := exec.LookPath(a.Bin); err != nil {
-			fmt.Fprintf(stderr, "orch: %s is not on PATH; install %s first\n", a.Bin, a.Name)
-			return 127
+			return cliError("build", asJSON, stdout, stderr, 127, "%s is not on PATH; install %s first", a.Bin, a.Name)
 		}
 	}
 
@@ -122,17 +127,14 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// behind, and the kernel releases it if this process is killed.
 	stateDir := filepath.Join(absDir, buildStateDir)
 	if err := ensureStateDir(stateDir); err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("build", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	workflowLock, err := lockWorkflow(stateDir)
 	if errors.Is(err, errRunLocked) {
-		fmt.Fprintln(stderr, "orch: another orch workflow is already running in this repository (see `orch status`); wait for it to finish before starting another")
-		return 2
+		return cliError("build", asJSON, stdout, stderr, 2, "another orch workflow is already running in this repository (see `orch status`); wait for it to finish before starting another")
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("build", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	defer func() { _ = workflowLock.Close() }()
 
@@ -142,22 +144,20 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// deadlock against each other.
 	runID, runDir, err := createRunDir(stateDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("build", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	lock, err := lockRun(runDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("build", asJSON, stdout, stderr, 1, "%v", err)
 	}
 	defer func() { _ = lock.Close() }()
 
 	b := &builder{
 		dir:    absDir,
 		runDir: runDir,
-		stdout: stdout,
+		stdout: agentOut,
 		stderr: stderr,
-		stage:  interactiveStage(absDir, runDir, stdin, stdout, opts.stageTimeout),
+		stage:  interactiveStage(absDir, runDir, stdin, agentOut, opts.stageTimeout),
 	}
 	b.verify = b.verifyRepo
 	b.verifySpecs = verifySpecs
@@ -169,7 +169,7 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		ID:           runID,
 		Task:         opts.task,
 		RepoDir:      absDir,
-		CreatedAt:    time.Now().Format(time.RFC3339),
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		StageTimeout: formatStageTimeout(opts.stageTimeout),
 		Knowledge:    opts.knowledge,
 		Status:       runStateRunning,
@@ -178,8 +178,7 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		Verify:       verifySpecs,
 	}
 	if err := writeRunState(runDir, *b.state); err != nil {
-		fmt.Fprintf(stderr, "orch: %v\n", err)
-		return 1
+		return cliError("build", asJSON, stdout, stderr, 1, "%v", err)
 	}
 
 	b.logf("artifacts: %s", runDir)
@@ -188,8 +187,21 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	} else {
 		b.logf("stage timeout: disabled")
 	}
-	if err := b.build(opts.task); err != nil {
-		fmt.Fprintf(stderr, "orch: build: %v\n", err)
+
+	buildErr := b.build(opts.task)
+	if asJSON {
+		code := 0
+		if buildErr != nil {
+			code = 1
+		}
+		if err := emitJSON(stdout, newRunResponse("build", runDir, b.state, code, buildErr)); err != nil {
+			fmt.Fprintf(stderr, "orch: %v\n", err)
+			return 1
+		}
+		return code
+	}
+	if buildErr != nil {
+		fmt.Fprintf(stderr, "orch: build: %v\n", buildErr)
 		return 1
 	}
 	fmt.Fprintf(stdout, "orch: build complete; artifacts in %s\n", runDir)
@@ -227,6 +239,8 @@ func parseBuildArgs(args []string) (buildOptions, error) {
 			}
 		case "--knowledge":
 			opts.knowledge = true
+		case "--json":
+			opts.json = true
 		case "--verify":
 			var raw string
 			raw, i, err = flagValue(args, i, name, value, hasValue)
@@ -309,18 +323,28 @@ func (b *builder) run(agentName, name, prompt string) (string, error) {
 			return "", err
 		}
 		b.logf("stage %s: replaying completed artifact", name)
-		b.completeStage(name)
+		if err := b.completeStage(name); err != nil {
+			return "", err
+		}
 		return text, nil
 	}
 
 	b.logf("stage %s: %s", name, agentName)
-	b.beginStage(name, agentName)
+	if err := b.beginStage(name, agentName); err != nil {
+		return "", err
+	}
 	text, err := b.stage(agentName, name, prompt)
 	if err != nil {
-		b.failStage(name, err)
+		// The stage already failed; a state-write failure here must not mask it,
+		// so it is logged and the original error is returned.
+		if ferr := b.failStage(name, err); ferr != nil {
+			b.logf("state: %v", ferr)
+		}
 		return "", fmt.Errorf("stage %s (%s): %w", name, agentName, err)
 	}
-	b.completeStage(name)
+	if err := b.completeStage(name); err != nil {
+		return "", err
+	}
 	return text, nil
 }
 
@@ -336,13 +360,19 @@ func (b *builder) replay(name string) (string, error) {
 
 // saveState persists run.json. A nil state (the unit-test builder) disables
 // persistence so the workflow's sequencing stays testable on its own.
-func (b *builder) saveState() {
+//
+// A write failure is returned rather than swallowed: run.json is the recovery
+// state a later resume reads, so silently losing a stage transition could make
+// resume misreport progress. Callers treat it as fatal (errStateWrite), which is
+// why resume never sees a stage recorded complete that was not actually written.
+func (b *builder) saveState() error {
 	if b.state == nil {
-		return
+		return nil
 	}
 	if err := writeRunState(b.runDir, *b.state); err != nil {
-		b.logf("state: %v", err)
+		return fmt.Errorf("%w: %v", errStateWrite, err)
 	}
+	return nil
 }
 
 // findStage returns the recorded stage with the given name, or nil.
@@ -386,9 +416,9 @@ func (b *builder) recomputeLastCompleted() {
 
 // beginStage records a stage as running before it launches. Re-running a stage
 // that had completed rewinds the progress cursor to just before it.
-func (b *builder) beginStage(name, agent string) {
+func (b *builder) beginStage(name, agent string) error {
 	if b.state == nil {
-		return
+		return nil
 	}
 	if s := b.findStage(name); s != nil {
 		s.Agent, s.Status = agent, stageRunning
@@ -398,13 +428,13 @@ func (b *builder) beginStage(name, agent string) {
 		})
 	}
 	b.recomputeLastCompleted()
-	b.saveState()
+	return b.saveState()
 }
 
 // completeStage records a stage as complete and advances the progress cursor.
-func (b *builder) completeStage(name string) {
+func (b *builder) completeStage(name string) error {
 	if b.state == nil {
-		return
+		return nil
 	}
 	if s := b.findStage(name); s != nil {
 		s.Status = stageCompleted
@@ -414,15 +444,15 @@ func (b *builder) completeStage(name string) {
 		})
 	}
 	b.recomputeLastCompleted()
-	b.saveState()
+	return b.saveState()
 }
 
 // failStage records why a stage did not complete. The progress cursor is left at
 // the last stage that actually completed, so a failed or timed-out stage never
 // counts as progress.
-func (b *builder) failStage(name string, cause error) {
+func (b *builder) failStage(name string, cause error) error {
 	if b.state == nil {
-		return
+		return nil
 	}
 	if s := b.findStage(name); s != nil {
 		s.Status = stageFailed
@@ -431,48 +461,55 @@ func (b *builder) failStage(name string, cause error) {
 		}
 	}
 	b.recomputeLastCompleted()
-	b.saveState()
+	return b.saveState()
 }
 
 // setVerify records the final verification outcome, which verify.log alone does
 // not express.
-func (b *builder) setVerify(result string) {
+func (b *builder) setVerify(result string) error {
 	if b.state == nil {
-		return
+		return nil
 	}
 	b.state.VerifyResult = result
-	b.saveState()
+	return b.saveState()
 }
 
 // finalize writes the run's terminal state once the workflow returns, so even a
-// failed or timed-out run leaves an explicit outcome in run.json.
-func (b *builder) finalize(err error) {
+// failed or timed-out run leaves an explicit, classified outcome in run.json.
+func (b *builder) finalize(runErr error) error {
 	if b.state == nil {
-		return
+		return nil
 	}
+	b.state.Failure, b.state.ExitCode = classifyFailure(runErr)
 	switch {
-	case err == nil:
+	case runErr == nil:
 		b.state.Status = runStateCompleted
 		b.state.Error = ""
-	case errors.Is(err, errStageTimeout):
+	case errors.Is(runErr, errStageTimeout):
 		b.state.Status = runStateTimedOut
-		b.state.Error = err.Error()
+		b.state.Error = runErr.Error()
 	default:
 		b.state.Status = runStateFailed
-		b.state.Error = err.Error()
+		b.state.Error = runErr.Error()
 	}
-	b.saveState()
+	return b.saveState()
 }
 
-// build runs the workflow and records its terminal state, so the run has an
-// explicit outcome even when it fails or times out.
+// build runs the workflow and records its terminal state. A failed terminal
+// write is surfaced too: the run's outcome must not be lost silently, so a
+// successful workflow whose outcome could not be persisted reports the failure.
 func (b *builder) build(task string) error {
 	if b.state != nil {
 		b.state.Task = task
 	}
-	err := b.workflow(task)
-	b.finalize(err)
-	return err
+	runErr := b.workflow(task)
+	if err := b.finalize(runErr); err != nil {
+		b.logf("state: %v", err)
+		if runErr == nil {
+			return err
+		}
+	}
+	return runErr
 }
 
 // workflow performs the full plan → review → implement → review → fix sequence
@@ -534,10 +571,14 @@ func (b *builder) workflow(task string) error {
 	}
 
 	if err := b.verify(); err != nil {
-		b.setVerify(verifyFailed)
+		if serr := b.setVerify(verifyFailed); serr != nil {
+			b.logf("state: %v", serr)
+		}
 		return err
 	}
-	b.setVerify(verifyPassed)
+	if err := b.setVerify(verifyPassed); err != nil {
+		return err
+	}
 	// Capture only once the run is approved and verified, so the knowledge layer
 	// records durable outcomes rather than failed attempts.
 	b.captureKnowledge(task)
@@ -582,6 +623,19 @@ func reviewApproved(review string) bool {
 // sentinel so callers can tell a liveness failure from an agent error, and the
 // build workflow can report the run as timed out.
 var errStageTimeout = errors.New("stage timed out")
+
+// agentExitError records an agent process that exited non-zero. It is a typed
+// error so the workflow can classify the failure as an agent failure and carry
+// the exit code into run.json and --json output, instead of collapsing every
+// stage failure into one opaque error.
+type agentExitError struct {
+	Agent string
+	Code  int
+}
+
+func (e *agentExitError) Error() string {
+	return fmt.Sprintf("%s exited with code %d", e.Agent, e.Code)
+}
 
 // interactiveStage is the production stage runner: it launches the agent on a
 // real pty, tees the terminal transcript to <name>.log, then reads back the
@@ -660,7 +714,7 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer, time
 		code, err := Run(argv, Options{
 			Dir:    dir,
 			Stdin:  stdin,
-			Stdout: io.MultiWriter(stdout, log),
+			Stdout: io.MultiWriter(stdout, newLimitWriter(log, maxLogBytes())),
 			Stop:   stop,
 		})
 		close(sessionDone)
@@ -679,7 +733,7 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer, time
 			return "", fmt.Errorf("stage %s (%s) did not finish within %s: %w", name, agentName, timeout, errStageTimeout)
 		default:
 			if code != 0 {
-				return "", fmt.Errorf("exited with code %d", code)
+				return "", &agentExitError{Agent: agentName, Code: code}
 			}
 		}
 
@@ -747,7 +801,7 @@ func (b *builder) verifyRepo() error {
 		return err
 	}
 	defer func() { _ = log.Close() }()
-	out := io.MultiWriter(b.stdout, log)
+	out := io.MultiWriter(b.stdout, newLimitWriter(log, maxLogBytes()))
 
 	var failures []string
 	for _, c := range b.verifySpecs {

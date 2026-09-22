@@ -52,8 +52,45 @@ const (
 	verifyFailed = "failed"
 )
 
+// Failure kinds recorded in run.json (and surfaced by --json), so a consumer can
+// tell an agent failure from orch's own errors and from a watchdog timeout or a
+// failed verification.
+const (
+	failureAgent    = "agent"    // an agent process exited non-zero
+	failureTimeout  = "timeout"  // the per-stage watchdog ended the stage
+	failureVerify   = "verify"   // repository verification failed
+	failureState    = "state"    // run.json could not be persisted
+	failureWorkflow = "workflow" // any other workflow failure
+)
+
 // errRunLocked reports that another orch process already owns the run.
 var errRunLocked = errors.New("run is already in progress")
+
+// errStateWrite marks a failure to persist run.json. It is fatal: continuing
+// would lose the recovery state a later resume depends on, and resume must never
+// see a stage recorded as complete when it was not written.
+var errStateWrite = errors.New("could not persist run state")
+
+// classifyFailure maps a workflow error to a failure kind and, when an agent
+// exited non-zero, to that agent's exit code. It keeps the distinctions the CLI
+// and --json report from collapsing into one opaque failure.
+func classifyFailure(err error) (kind string, code int) {
+	var ae *agentExitError
+	switch {
+	case err == nil:
+		return "", 0
+	case errors.As(err, &ae):
+		return failureAgent, ae.Code
+	case errors.Is(err, errStageTimeout):
+		return failureTimeout, 0
+	case errors.Is(err, errVerifyFailed):
+		return failureVerify, 0
+	case errors.Is(err, errStateWrite):
+		return failureState, 0
+	default:
+		return failureWorkflow, 0
+	}
+}
 
 // stageState is one stage of the workflow as recorded in run.json.
 type stageState struct {
@@ -78,6 +115,8 @@ type runState struct {
 	BaseCommit    string       `json:"baseCommit"`
 	Verify        []verifySpec `json:"verify,omitempty"`
 	VerifyResult  string       `json:"verifyResult,omitempty"`
+	Failure       string       `json:"failure,omitempty"`
+	ExitCode      int          `json:"exitCode,omitempty"`
 	Error         string       `json:"error,omitempty"`
 }
 
@@ -149,7 +188,7 @@ func createRunDir(stateDir string) (id, dir string, err error) {
 	if err := ensureStateDir(stateDir); err != nil {
 		return "", "", err
 	}
-	base := time.Now().Format("20060102-150405")
+	base := time.Now().UTC().Format("20060102-150405")
 	for i := 0; i < 1000; i++ {
 		id = base
 		if i > 0 {
