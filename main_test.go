@@ -97,3 +97,89 @@ func TestListAgents(t *testing.T) {
 		}
 	}
 }
+
+// TestRunValidatesFlagsBeforeBinaryLookup guards the ordering requirement: the
+// permission-bypass denylist must be enforced even when the agent binary is not
+// installed, so a forbidden flag returns 2, not the 127 a missing binary yields.
+// PATH points at an empty directory, so no agent exists on this machine.
+func TestRunValidatesFlagsBeforeBinaryLookup(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	tests := []struct {
+		name    string
+		args    []string
+		want    int
+		wantErr string // substring expected on stderr; "" means no assertion
+	}{
+		{
+			"forbidden flag with missing binary",
+			[]string{"run", "agy", "--", "--dangerously-skip-permissions"},
+			2, "auto-approve",
+		},
+		{
+			"yolo with missing binary",
+			[]string{"run", "agy", "--", "--yolo"},
+			2, "auto-approve",
+		},
+		{
+			"short yolo with missing binary",
+			[]string{"run", "agy", "--", "-y"},
+			2, "auto-approve",
+		},
+		{
+			"clustered yolo with missing binary",
+			[]string{"run", "agy", "--", "-cy"},
+			2, "auto-approve",
+		},
+		{
+			"permission-mode value with missing binary",
+			[]string{"run", "command-code", "--", "--permission-mode=accept-all"},
+			2, "auto-approve",
+		},
+		{
+			"agent-specific trust with missing binary",
+			[]string{"run", "command-code", "--", "-t"},
+			2, "auto-approve",
+		},
+		{
+			"allowed flag with missing binary",
+			[]string{"run", "agy", "--", "--verbose"},
+			127, "",
+		},
+		{
+			"no extra args with missing binary",
+			[]string{"run", "agy"},
+			127, "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := orchMain(tt.args, nil, &stdout, &stderr); got != tt.want {
+				t.Errorf("orchMain(%q) = %d, want %d (stderr: %s)", tt.args, got, tt.want, stderr.String())
+			}
+			if tt.wantErr != "" && !strings.Contains(stderr.String(), tt.wantErr) {
+				t.Errorf("stderr = %q, want it to mention %q (the flag must be rejected, not the binary)", stderr.String(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunChecksBinariesOnlyAfterValidation covers the chain path: with every
+// command line valid, a missing binary is still reported as 127 (the binary
+// check runs, but only after validation), while an unknown agent name is
+// rejected as 2 beforehand.
+func TestRunChecksBinariesOnlyAfterValidation(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if got := orchMain([]string{"run", "agy", "copilot"}, nil, &stdout, &stderr); got != 127 {
+		t.Errorf("orchMain(chain, missing binaries) = %d, want 127 (stderr: %s)", got, stderr.String())
+	}
+
+	stderr.Reset()
+	if got := orchMain([]string{"run", "agy", "nope"}, nil, &stdout, &stderr); got != 2 {
+		t.Errorf("orchMain(chain, unknown agent) = %d, want 2 (stderr: %s)", got, stderr.String())
+	}
+}
