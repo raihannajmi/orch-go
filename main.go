@@ -221,6 +221,16 @@ Flags for run
 Flags for build
   -C, --dir <path>     repository the agents work in (default: current)
   --stage-timeout <d>  end a stage that makes no progress for <d> (default 30m, 0 disables)
+  --knowledge          load and capture durable knowledge (see Knowledge below)
+
+Knowledge
+  With --knowledge, orch loads relevant context before the run and records the
+  approved outcome afterwards. It is off by default and never required. The
+  backend is configured by environment:
+    ORCH_KNOWLEDGE_VAULT    path to an Obsidian vault (required to enable)
+    ORCH_KNOWLEDGE_PROJECT  project folder under 01-Projects/ (default: repo dir name)
+  Knowledge problems are warnings: a failure to load or capture never fails the
+  build.
 
 Status and logs
   orch status lists each run under .orch/ with its stage count, the verdict

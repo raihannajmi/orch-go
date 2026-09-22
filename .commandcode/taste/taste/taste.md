@@ -27,3 +27,12 @@
 - For CI setup, wants the workflow kept simple and maintainable — minimal jobs/steps and no unnecessary machinery. Confidence: 0.6
 - For CI, wants the Go toolchain version sourced from go.mod (e.g. `go-version-file: go.mod`) and dependency caching enabled, rather than hardcoding a version. Confidence: 0.6
 - After writing config files (e.g. workflow YAML), wants their syntax validated where practical before reporting done. Confidence: 0.55
+- Prefers a clean provider/interface boundary that decouples the core from optional external systems (e.g. core must never depend directly on Obsidian or Graphify); design it so new backends can be added without changing workflow code. Confidence: 0.7
+- Wants optional features off by default behind a no-op implementation, so existing behavior works unchanged with zero external dependencies. Confidence: 0.65
+- Prefers keeping the CLI surface simple for new features: a single opt-in flag, with configuration driven by environment variables rather than piling on more flags. Confidence: 0.6
+- For optional/best-effort subsystems, wants failures to degrade gracefully as visible warnings rather than hard failures that break the core workflow, and wants that failure semantic decided and documented. Confidence: 0.6
+- For persistence, prefers updating existing artifacts before creating new ones and never writing transient/debug output into the durable store of record (avoid per-run noise). Confidence: 0.6
+- Treats externally-sourced content injected into agent prompts (loaded knowledge, notes, third-party data) as untrusted data, kept structurally separate from trusted workflow instructions and the user task, e.g. fenced in an explicit labeled boundary and marked as reference-only that must not be followed as instructions. Confidence: 0.8
+- Prefers structural defenses over content sanitization: preserve injected content verbatim rather than filtering/blacklisting suspicious words, and neutralize boundary markers so data cannot escape its fence — relying on prompt structure to establish trust. Confidence: 0.75
+- When hardening against a class of issue, wants all relevant injection/entry points reviewed and fixed, not just the reported one, while keeping stable interfaces (e.g. the provider interface) unchanged where possible. Confidence: 0.7
+- For trust/security-boundary work, wants negative/adversarial tests proving untrusted content cannot alter the fixed instruction structure, alongside tests that legitimate behavior and disabled-feature paths are unchanged. Confidence: 0.65

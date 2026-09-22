@@ -129,6 +129,26 @@ Every run creates a timestamped directory under `.orch/<run-id>/` containing Mar
 
 If changes are requested, subsequent fix and review cycles continue numbering sequentially (e.g. `5-fix.md`, `6-review.md`, etc.).
 
+### `orch build --knowledge` (optional knowledge layer)
+
+`orch build` can optionally load context before a run and record durable outcomes after one. It is **off by default**: without `--knowledge`, `orch build "task"` behaves exactly as before and needs no external system. The orchestrator talks only to an internal `knowledge.Provider` interface whose default is a no-op, so Obsidian and Graphify stay behind that boundary.
+
+The first backend is Obsidian, configured by environment (the CLI stays a single flag):
+
+| Variable | Meaning |
+| --- | --- |
+| `ORCH_KNOWLEDGE_VAULT` | Absolute path to an Obsidian vault (required to enable) |
+| `ORCH_KNOWLEDGE_PROJECT` | Project folder under `01-Projects/` (default: repository directory name) |
+
+```sh
+ORCH_KNOWLEDGE_VAULT=~/Obsidian/najmiraihan orch build "harden the auth boundary" --knowledge
+```
+
+- **Retrieval:** before planning, orch reads the project's context note plus only the decisions/problems/learning notes whose filenames match the task. The whole vault is never read.
+- **Trust boundary:** loaded knowledge is untrusted data. It is injected into the planning prompt only inside an explicit `<external_knowledge>…</external_knowledge>` fence, labeled as reference material that must not be followed as instructions, and it can never override the task or the workflow instructions. Content is preserved as-is (nothing is filtered), and a note cannot close the fence early because its own boundary tags are neutralized.
+- **Capture:** after an approved run, orch appends one entry to the project's single `build-log.md`. It updates that note rather than creating a note per run, and never writes prompts, transcripts, or debugging output.
+- **Failure semantics:** knowledge is best-effort. A missing vault or a failed load/capture prints a warning and the build continues — the knowledge layer can neither fail nor silently corrupt a run. Graphify is not wired in yet; it will implement the same provider interface.
+
 ### `orch status`
 
 Lists the workflow runs recorded under `.orch/`, newest first, with each run's stage count, the verdict of its final review (`APPROVED`, `REJECTED`, or `-` when no review artifact exists), and the stage a watchdog ended (`-` unless the run timed out). A missing `.orch/` is not an error; it reports that no runs exist yet.
