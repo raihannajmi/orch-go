@@ -410,3 +410,21 @@ func TestBeginStageRewindsLastCompleted(t *testing.T) {
 		t.Errorf("lastCompleted = %d, want 2 after re-running stage 3", got)
 	}
 }
+
+// TestRunIDIsUTC pins the run id to the UTC wall clock: it is parsed as a UTC
+// timestamp and must be within a couple of seconds of UTC now. On a host with a
+// non-UTC timezone a local-time id would be off by the offset and fail.
+func TestRunIDIsUTC(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), buildStateDir)
+	id, _, err := createRunDir(stateDir)
+	if err != nil {
+		t.Fatalf("createRunDir: %v", err)
+	}
+	got, err := time.Parse("20060102-150405", id)
+	if err != nil {
+		t.Fatalf("run id %q is not a timestamp: %v", id, err)
+	}
+	if d := time.Since(got); d < -3*time.Second || d > 3*time.Second {
+		t.Errorf("run id %q is %s from UTC now; want a UTC timestamp", id, d)
+	}
+}
