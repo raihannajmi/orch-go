@@ -75,6 +75,7 @@ type runState struct {
 	Stages        []stageState `json:"stages"`
 	LastCompleted int          `json:"lastCompleted"`
 	BaseCommit    string       `json:"baseCommit"`
+	Verify        []verifySpec `json:"verify,omitempty"`
 	VerifyResult  string       `json:"verifyResult,omitempty"`
 	Error         string       `json:"error,omitempty"`
 }

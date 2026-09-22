@@ -66,6 +66,7 @@ type buildOptions struct {
 	dir          string        // repository the agents work in (default: current directory)
 	stageTimeout time.Duration // per-stage watchdog; 0 disables it
 	knowledge    bool          // load/capture durable knowledge (opt-in)
+	verify       []string      // --verify commands, in order; empty means auto-detect
 }
 
 func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
@@ -88,6 +89,14 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		dir = "."
 	}
 	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 2
+	}
+
+	// Resolve the verification commands before anything runs, so a repository
+	// orch cannot verify fails fast instead of after a full agent workflow.
+	verifySpecs, err := resolveVerify(absDir, opts.verify)
 	if err != nil {
 		fmt.Fprintf(stderr, "orch: %v\n", err)
 		return 2
@@ -131,6 +140,7 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		stage:  interactiveStage(absDir, runDir, stdin, stdout, opts.stageTimeout),
 	}
 	b.verify = b.verifyRepo
+	b.verifySpecs = verifySpecs
 	if b.knowledge = openKnowledge(opts.knowledge, absDir, b.logf); b.knowledge != nil {
 		defer b.knowledge.close()
 	}
@@ -145,6 +155,7 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		Status:       runStateRunning,
 		Stages:       []stageState{},
 		BaseCommit:   gitBaseCommit(absDir),
+		Verify:       verifySpecs,
 	}
 	if err := writeRunState(runDir, *b.state); err != nil {
 		fmt.Fprintf(stderr, "orch: %v\n", err)
@@ -196,6 +207,12 @@ func parseBuildArgs(args []string) (buildOptions, error) {
 			}
 		case "--knowledge":
 			opts.knowledge = true
+		case "--verify":
+			var raw string
+			raw, i, err = flagValue(args, i, name, value, hasValue)
+			if err == nil {
+				opts.verify = append(opts.verify, raw)
+			}
 		default:
 			return opts, fmt.Errorf("unknown flag %q for build", arg)
 		}
@@ -231,8 +248,10 @@ type builder struct {
 	// stage runs one interactive agent stage and returns the text of the
 	// artifact the agent wrote.
 	stage func(agentName, name, prompt string) (string, error)
-	// verify runs the final gofmt / go vet / go test pass.
+	// verify runs the final verification pass.
 	verify func() error
+	// verifySpecs are the verification commands verifyRepo executes, in order.
+	verifySpecs []verifySpec
 
 	// knowledge is the optional knowledge session. Nil means knowledge is off,
 	// so an absent layer never changes the workflow.
@@ -689,20 +708,11 @@ func stripStageMarker(s string) string {
 	return trimmed
 }
 
-// verifyRepo runs the mandated final checks in the repository and fails if any
-// of them report a problem.
+// verifyRepo runs the configured verification commands in the repository, in
+// order, and fails if any of them report a problem. The failure is wrapped in
+// errVerifyFailed so a verification failure stays distinguishable from an agent
+// failure. It never uses a shell: each command's argv is executed directly.
 func (b *builder) verifyRepo() error {
-	type check struct {
-		name    string
-		argv    []string
-		emptyOK bool // fail when the command produces output (gofmt -l)
-	}
-	checks := []check{
-		{name: "gofmt", argv: []string{"gofmt", "-l", "."}, emptyOK: true},
-		{name: "go vet", argv: []string{"go", "vet", "./..."}},
-		{name: "go test", argv: []string{"go", "test", "./..."}},
-	}
-
 	logPath := filepath.Join(b.runDir, "verify.log")
 	log, err := os.Create(logPath)
 	if err != nil {
@@ -712,9 +722,9 @@ func (b *builder) verifyRepo() error {
 	out := io.MultiWriter(b.stdout, log)
 
 	var failures []string
-	for _, c := range checks {
-		b.logf("verify: %s", strings.Join(c.argv, " "))
-		cmd := exec.Command(c.argv[0], c.argv[1:]...)
+	for _, c := range b.verifySpecs {
+		b.logf("verify: %s", strings.Join(c.Argv, " "))
+		cmd := exec.Command(c.Argv[0], c.Argv[1:]...)
 		cmd.Dir = b.dir
 		output, runErr := cmd.CombinedOutput()
 		_, _ = out.Write(output)
@@ -723,14 +733,14 @@ func (b *builder) verifyRepo() error {
 		}
 
 		switch {
-		case c.emptyOK && strings.TrimSpace(string(output)) != "":
-			failures = append(failures, c.name+" reported files that need formatting")
-		case !c.emptyOK && runErr != nil:
-			failures = append(failures, fmt.Sprintf("%s failed: %v", c.name, runErr))
+		case c.EmptyOK && strings.TrimSpace(string(output)) != "":
+			failures = append(failures, c.Name+" reported files that need formatting")
+		case !c.EmptyOK && runErr != nil:
+			failures = append(failures, fmt.Sprintf("%s failed: %v", c.Name, runErr))
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("verification failed: %s", strings.Join(failures, "; "))
+		return fmt.Errorf("%w: %s", errVerifyFailed, strings.Join(failures, "; "))
 	}
 	b.logf("verification passed")
 	return nil

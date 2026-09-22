@@ -113,14 +113,23 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// before it are replayed from disk, never re-launched.
 	st.Stages = st.Stages[:resumeFrom]
 
+	// Verify with the commands the run was created with, so a resume checks the
+	// same thing the original run would have.
+	verifySpecs, err := resumeVerifySpecs(st)
+	if err != nil {
+		fmt.Fprintf(stderr, "orch: cannot resume run %s: %v\n", id, err)
+		return 1
+	}
+
 	b := &builder{
-		dir:        st.RepoDir,
-		runDir:     runDir,
-		stdout:     stdout,
-		stderr:     stderr,
-		stage:      interactiveStage(st.RepoDir, runDir, stdin, stdout, parseStateTimeout(st.StageTimeout)),
-		state:      &st,
-		resumeFrom: resumeFrom,
+		dir:         st.RepoDir,
+		runDir:      runDir,
+		stdout:      stdout,
+		stderr:      stderr,
+		stage:       interactiveStage(st.RepoDir, runDir, stdin, stdout, parseStateTimeout(st.StageTimeout)),
+		state:       &st,
+		resumeFrom:  resumeFrom,
+		verifySpecs: verifySpecs,
 	}
 	b.verify = b.verifyRepo
 	if b.knowledge = openKnowledge(st.Knowledge, st.RepoDir, b.logf); b.knowledge != nil {

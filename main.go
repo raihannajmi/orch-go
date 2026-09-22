@@ -225,6 +225,7 @@ Flags for run
 Flags for build
   -C, --dir <path>     repository the agents work in (default: current)
   --stage-timeout <d>  end a stage that makes no progress for <d> (default 30m, 0 disables)
+  --verify <command>   verification command to run at the end (repeatable; default: auto-detect)
   --knowledge          load and capture durable knowledge (see Knowledge below)
 
 Knowledge
@@ -237,6 +238,17 @@ Knowledge
     ORCH_KNOWLEDGE_GRAPH     graph.json to query (default: <vault>/graphify-out/graph.json)
   Obsidian is the source of truth; Graphify only enriches context. Knowledge
   problems are warnings: a failure to load or capture never fails the build.
+
+Verification
+  Every build ends with verification commands run in the repository. They come
+  from --verify when given (repeatable, run in order), otherwise from a recipe
+  auto-detected from the repository: go.mod runs gofmt -l ., go vet ./... and
+  go test ./...; Cargo.toml runs cargo check and cargo test; package.json runs
+  npm run for the lint/check/typecheck/test scripts it already defines. A
+  repository with none of these needs an explicit --verify: orch refuses to run
+  a workflow it cannot verify. Commands run without a shell (no pipes,
+  redirection, globbing or variable expansion), and a verification failure is
+  reported and recorded separately from an agent failure.
 
 Status and logs
   orch status lists each run under .orch/ with its stage count, the verdict
@@ -270,6 +282,7 @@ is saved under .orch/<run-id>/. Once a stage writes its completion marker,
 orch ends that session and moves on, so a finished stage cannot stall the run.
 A stage that stops making progress is ended by a per-stage watchdog (see
 --stage-timeout) and the run stops there instead of waiting forever.
-The run finishes with gofmt, go vet ./... and go test ./... in the repository.
+The run finishes with the verification commands (see Verification above),
+auto-detected and overridable with --verify.
 `)
 }

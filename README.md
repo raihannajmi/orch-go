@@ -98,15 +98,37 @@ Executes an automated multi-stage build workflow combining planning, plan review
 3. **Implementation (`agy`):** Implements code changes based on the plan and plan review.
 4. **Implementation Review (`command-code`):** Inspects actual repository changes.
 5. **Fix / Re-review Loop:** If changes are requested, `agy` addresses review points and `command-code` re-reviews. Orch allows up to 3 implementation/review cycles (`buildPlanCycles = 3`). The workflow proceeds only when a review artifact ends with an explicit `VERDICT: APPROVED`.
-6. **Repository Verification:** Runs standard checks in the repository:
-   - `gofmt -l .` (fails if files need formatting)
-   - `go vet ./...`
-   - `go test ./...`
+6. **Repository Verification:** Runs the configured verification commands in the repository (see [Verification](#verification) below).
 
 **Flags:**
 - `-C, --dir <path>`: Repository directory where agents work (default: current directory).
 - `--stage-timeout <duration>`: End a stage that makes no progress for this long, e.g. `--stage-timeout 45m` (default `30m`; `0` disables the watchdog).
+- `--verify <command>`: Verification command to run at the end, in order, and repeatable. Overrides auto-detection.
 - `--knowledge`: Load relevant context before planning and capture durable outcomes after approved runs (see below).
+
+### Verification
+
+Every `orch build` (and `orch resume`) ends with verification commands run in the repository. A verification failure fails the run, is reported distinctly from an agent failure, and is recorded in `run.json` (`verifyResult: "failed"`).
+
+Commands are chosen as follows:
+
+1. **Explicit `--verify`**, when given. Repeatable; commands run in order. The value is split into argv by `orch` itself — there is no shell, so no pipes, redirection, globbing, command substitution or variable expansion.
+2. **Auto-detection** from the repository, when no `--verify` is given:
+   - `go.mod` → `gofmt -l .`, `go vet ./...`, `go test ./...`
+   - `Cargo.toml` → `cargo check`, `cargo test`
+   - `package.json` → `npm run <script>` for each of `lint`, `check`, `typecheck`, `test` that the package already defines (in that order). Scripts are never invented, and a bare package-manager command is never run on a guess.
+3. **Otherwise** `orch` refuses to start, rather than run a workflow whose result it cannot check.
+
+Commands execute in the repository directory (`-C/--dir`). The verification commands a run used are stored in `run.json`, so `orch resume` re-runs exactly the same checks.
+
+```sh
+# Go repository: auto-detected (gofmt, go vet, go test)
+orch build "add a --json flag"
+
+# Any repository: explicit commands, run in order
+orch build "fix the parser" --verify "make lint" --verify "make test"
+orch build "harden the auth boundary" -C ~/src/app --verify "pytest -q"
+```
 
 **Stage Completion Signal:**
 Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
