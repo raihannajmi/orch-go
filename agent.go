@@ -210,6 +210,32 @@ func shortCluster(name string) []string {
 	return out
 }
 
+// OS argument limits. A stage prompt (task plus inlined context and knowledge)
+// is passed to the agent as a single command-line argument, and the kernel caps
+// how large that can be (Linux MAX_ARG_STRLEN is 128 KiB). orch checks before it
+// execs so an oversized prompt is a clear, actionable error instead of a
+// confusing E2BIG crash, and it never silently truncates the user's task.
+const (
+	maxArgBytes      = 128 * 1024 // one command-line argument
+	maxArgTotalBytes = 512 * 1024 // the whole command line
+)
+
+// checkArgvSize refuses a command line the OS would reject, naming the likely
+// cause rather than leaving the operator with a bare "argument list too long".
+func checkArgvSize(argv []string) error {
+	total := 0
+	for _, a := range argv {
+		if len(a) > maxArgBytes {
+			return fmt.Errorf("a single argument of %d bytes exceeds the %d-byte OS limit; the agent receives its prompt as a command-line argument, so shorten the task or disable --knowledge (loaded context is inlined into the prompt)", len(a), maxArgBytes)
+		}
+		total += len(a) + 1
+	}
+	if total > maxArgTotalBytes {
+		return fmt.Errorf("the command line of %d bytes exceeds the %d-byte OS limit; shorten the task or disable --knowledge", total, maxArgTotalBytes)
+	}
+	return nil
+}
+
 // buildArgv assembles the command line for one session: the agent binary, then
 // orch's own flags mapped to the agent's spelling, then the user's pass-through
 // arguments.
@@ -252,5 +278,11 @@ func buildArgv(a Agent, opts runOptions) ([]string, error) {
 		argv = append(argv, opts.prompt)
 	}
 	argv = append(argv, opts.extra...)
+
+	// Size is validated last: security first, then the OS limit. Neither check
+	// depends on the agent being installed.
+	if err := checkArgvSize(argv); err != nil {
+		return nil, fmt.Errorf("%s: %w", a.Name, err)
+	}
 	return argv, nil
 }

@@ -92,6 +92,9 @@ func Run(argv []string, opts Options) (int, error) {
 	// Start puts the agent in its own session with the pty as controlling terminal.
 	ptmx, err := pty.StartWithSize(cmd, size)
 	if err != nil {
+		if errors.Is(err, syscall.E2BIG) {
+			return 0, fmt.Errorf("cannot start %s: the command line is too long for the OS; shorten the task or reduce inlined context: %w", argv[0], err)
+		}
 		return 0, fmt.Errorf("start %s: %w", argv[0], err)
 	}
 	defer func() { _ = ptmx.Close() }()

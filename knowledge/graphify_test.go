@@ -85,10 +85,44 @@ func TestGraphifyEnabledQueriesTheGraph(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read recorded args: %v", err)
 	}
-	for _, want := range []string{"query", "fix the pty bug", "--graph", graph} {
-		if !strings.Contains(string(args), want) {
-			t.Errorf("graphify was not invoked with %q; args:\n%s", want, args)
-		}
+	// The flags precede `--`, and the task is the final positional argument.
+	want := []string{"query", "--graph", graph, "--", "fix the pty bug"}
+	if got := recordedArgs(args); strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("graphify argv = %q, want %q", got, want)
+	}
+}
+
+// recordedArgs splits the fake graphify's recorded argv (one argument per line).
+func recordedArgs(raw []byte) []string {
+	return strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+}
+
+// TestGraphifyTaskCannotBeAFlag covers argument safety: a task that looks like a
+// graphify flag is passed after `--`, so it can never change the invocation.
+func TestGraphifyTaskCannotBeAFlag(t *testing.T) {
+	graph := writeFile(t, "graph.json", "{}")
+
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	bin := filepath.Join(dir, "graphify")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + argsFile + "'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in graphify: %v", err)
+	}
+
+	g := NewGraphify(GraphifyConfig{Bin: bin, Graph: graph})
+	task := "--graph /etc/passwd --yolo"
+	if _, err := g.Load(context.Background(), Request{Task: task}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read recorded args: %v", err)
+	}
+	want := []string{"query", "--graph", graph, "--", task}
+	if got := recordedArgs(args); strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("graphify argv = %q, want %q (the task must stay a positional after --)", got, want)
 	}
 }
 

@@ -28,9 +28,13 @@ type GraphifyConfig struct {
 }
 
 // Graphify queries the graphify CLI for context related to the task. It shells
-// out to the documented command `graphify query "<question>" --graph <path>`,
+// out to the documented command `graphify query --graph <path> -- <question>`,
 // the same mechanism the vault's graphify rules use; it speaks no MCP protocol
 // of its own.
+//
+// The task is user-derived, so it is placed after a `--` terminator: the flags
+// (the operator-set graph path) always precede it, and a task that happens to
+// start with a dash can never be parsed by graphify as a flag.
 type Graphify struct {
 	bin     string
 	graph   string
@@ -67,7 +71,7 @@ func (g *Graphify) Load(ctx context.Context, req Request) ([]Document, error) {
 
 	qctx, cancel := context.WithTimeout(ctx, g.timeout)
 	defer cancel()
-	cmd := exec.CommandContext(qctx, bin, "query", req.Task, "--graph", g.graph)
+	cmd := exec.CommandContext(qctx, bin, "query", "--graph", g.graph, "--", req.Task)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
