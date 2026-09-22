@@ -13,9 +13,10 @@ import (
 
 // runInfo summarizes one `orch build` run recorded under .orch/.
 type runInfo struct {
-	id      string
-	stages  int    // number of Markdown stage artifacts
-	verdict string // outcome of the last review, or "-" when there is none
+	id       string
+	stages   int    // number of Markdown stage artifacts
+	verdict  string // outcome of the last review, or "-" when there is none
+	timedOut string // stage the watchdog ended, or "" when the run never timed out
 }
 
 // cmdStatus lists the workflow runs under .orch/, newest first.
@@ -39,9 +40,13 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "%-16s  %6s  %s\n", "RUN-ID", "STAGES", "VERDICT")
+	fmt.Fprintf(stdout, "%-16s  %6s  %-9s  %s\n", "RUN-ID", "STAGES", "VERDICT", "TIMED OUT")
 	for _, r := range runs {
-		fmt.Fprintf(stdout, "%-16s  %6d  %s\n", r.id, r.stages, r.verdict)
+		timedOut := "-"
+		if r.timedOut != "" {
+			timedOut = r.timedOut
+		}
+		fmt.Fprintf(stdout, "%-16s  %6d  %-9s  %s\n", r.id, r.stages, r.verdict, timedOut)
 	}
 	return 0
 }
@@ -90,6 +95,9 @@ func readRun(dir, id string) (runInfo, error) {
 		}
 		if strings.HasSuffix(name, ".md") {
 			r.stages++
+		}
+		if strings.HasSuffix(name, ".timeout") && r.timedOut == "" {
+			r.timedOut = strings.TrimSuffix(name, ".timeout")
 		}
 		if !strings.HasSuffix(name, "-review.md") {
 			continue

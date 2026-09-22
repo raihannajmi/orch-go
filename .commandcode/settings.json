@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Shell(go:*)",
-      "Shell(ls:*)"
+      "Shell(ls:*)",
+      "Shell(gofmt:*)",
+      "Shell(cd:*)",
+      "Shell(sed:*)",
+      "Shell(head:*)"
     ],
     "deny": [],
     "defaultMode": "default"

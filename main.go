@@ -220,12 +220,14 @@ Flags for run
 
 Flags for build
   -C, --dir <path>     repository the agents work in (default: current)
+  --stage-timeout <d>  end a stage that makes no progress for <d> (default 30m, 0 disables)
 
 Status and logs
-  orch status lists each run under .orch/ with its stage count and the verdict
-  of its final review. orch logs <run-id> lists that run's Markdown artifacts
-  and raw terminal transcripts so you can read or open them; the run id is the
-  directory name under .orch/ and the first column of orch status.
+  orch status lists each run under .orch/ with its stage count, the verdict
+  of its final review, and the stage a watchdog ended if the run timed out.
+  orch logs <run-id> lists that run's Markdown artifacts and raw terminal
+  transcripts so you can read or open them; the run id is the directory name
+  under .orch/ and the first column of orch status.
 
 Agents run one after another, each owning the terminal; if one exits non-zero
 the rest are skipped and orch exits with that code.
@@ -240,6 +242,8 @@ three times until a review explicitly approves. Each stage is a normal
 interactive session with its own permission prompts, and every stage's output
 is saved under .orch/<run-id>/. Once a stage writes its completion marker,
 orch ends that session and moves on, so a finished stage cannot stall the run.
+A stage that stops making progress is ended by a per-stage watchdog (see
+--stage-timeout) and the run stops there instead of waiting forever.
 The run finishes with gofmt, go vet ./... and go test ./... in the repository.
 `)
 }

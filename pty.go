@@ -11,11 +11,21 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // stopGracePeriod is how long a session may linger after orch asks it to end
 // before it is killed outright, so a wedged UI cannot stall a workflow.
 const stopGracePeriod = 2 * time.Second
+
+// inputPollInterval bounds how long forwardInput waits for a keystroke before it
+// re-checks whether the session has ended, so the reader is released when the
+// session ends instead of parking on the terminal forever.
+const inputPollInterval = 250 * time.Millisecond
+
+// errPollTimeout reports that no input arrived within the poll wait.
+var errPollTimeout = errors.New("no input ready")
 
 // Options configures one interactive agent session.
 type Options struct {
@@ -62,24 +72,29 @@ func Run(argv []string, opts Options) (int, error) {
 		}
 	}
 
+	interactive := opts.Stdin != nil
+
+	// The agent owns the line discipline from here on: raw mode stops the local
+	// terminal from consuming arrow keys, control characters, and permission-
+	// prompt keystrokes on the way through. It is switched before the agent
+	// starts so a failure can be reported without a live process to clean up. A
+	// piped stdin is not a terminal, so there is nothing to switch and keystrokes
+	// are merely forwarded; a real terminal that cannot go raw is a platform orch
+	// does not support, and that fails here rather than silently dropping input.
+	if interactive && term.IsTerminal(int(opts.Stdin.Fd())) {
+		saved, err := rawMode(int(opts.Stdin.Fd()))
+		if err != nil {
+			return 0, fmt.Errorf("raw mode: %w", err)
+		}
+		defer func() { _ = restoreTermios(int(opts.Stdin.Fd()), saved) }()
+	}
+
 	// Start puts the agent in its own session with the pty as controlling terminal.
 	ptmx, err := pty.StartWithSize(cmd, size)
 	if err != nil {
 		return 0, fmt.Errorf("start %s: %w", argv[0], err)
 	}
 	defer func() { _ = ptmx.Close() }()
-
-	interactive := opts.Stdin != nil
-	if interactive {
-		// The agent owns the line discipline from here on: raw mode stops the
-		// local terminal from consuming arrow keys, control characters, and
-		// permission-prompt keystrokes on the way through.
-		var saved *syscall.Termios
-		saved, _ = rawMode(int(opts.Stdin.Fd()))
-		if saved != nil {
-			defer func() { _ = restoreTermios(int(opts.Stdin.Fd()), saved) }()
-		}
-	}
 
 	// Follow terminal resizes so the agent redraws at the right size.
 	winch := make(chan os.Signal, 1)
@@ -127,7 +142,9 @@ func Run(argv []string, opts Options) (int, error) {
 	}()
 
 	if interactive {
-		go forwardInput(opts.Stdin, ptmx, output)
+		// The fd is resolved here, not in the goroutine: reading it after Run
+		// returns would race a caller closing its stdin file.
+		go forwardInput(int(opts.Stdin.Fd()), ptmx, output)
 	}
 
 	// A caller that knows the agent is done (its artifact is complete) can ask
@@ -173,32 +190,59 @@ func killGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
-// forwardInput copies keystrokes to the pty until either side goes away: done is
-// closed once the agent's output has drained.
+// forwardInput copies keystrokes from the terminal fd to the pty until the
+// session ends or stdin goes away.
+//
+// It polls stdin rather than blocking in a bare Read so that closing done —
+// which happens when the agent is gone — releases this goroutine at once.
+// Without that, every stage of a build would leave a reader parked on the
+// terminal until the next keystroke.
 //
 // ponytail: a keystroke typed in the instant between one agent exiting and the
 // next starting can be dropped (it never reaches the wrong agent, since the
 // write fails once the pty is closed). Polling stdin and this channel together
 // would close that gap; not worth the machinery while a session owns the
 // terminal alone.
-func forwardInput(in, ptmx *os.File, done <-chan struct{}) {
+func forwardInput(fd int, ptmx *os.File, done <-chan struct{}) {
 	buf := make([]byte, 4096)
 	for {
-		n, err := in.Read(buf)
-		if n > 0 {
-			select {
-			case <-done:
-				return
-			default:
-			}
-			if _, werr := ptmx.Write(buf[:n]); werr != nil {
-				return
-			}
+		select {
+		case <-done:
+			return
+		default:
 		}
-		if err != nil {
+		n, err := pollRead(fd, buf, inputPollInterval)
+		if errors.Is(err, errPollTimeout) {
+			continue
+		}
+		if err != nil || n == 0 { // EOF or a real read error ends the forwarder
+			return
+		}
+		if _, werr := ptmx.Write(buf[:n]); werr != nil {
 			return
 		}
 	}
+}
+
+// pollRead waits up to wait for fd to become readable, then reads once. It
+// reports errPollTimeout when the wait elapses with no input and (0, nil) at
+// EOF.
+func pollRead(fd int, buf []byte, wait time.Duration) (int, error) {
+	pfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(pfds, int(wait.Milliseconds()))
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return 0, errPollTimeout
+		}
+		break
+	}
+	return unix.Read(fd, buf)
 }
 
 // exitCode reports the agent's exit status, following the shell convention of

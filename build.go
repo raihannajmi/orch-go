@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,6 +45,12 @@ const (
 	stageMarker = "ORCH_STAGE_COMPLETE"
 	// stagePollInterval is how often orch re-reads the artifact for the marker.
 	stagePollInterval = 200 * time.Millisecond
+
+	// defaultStageTimeout is the per-stage watchdog. A stage that neither writes
+	// its completion marker nor exits within this window is ended and the run is
+	// marked timed out, so a wedged agent cannot stall the workflow forever.
+	// Override with --stage-timeout; 0 disables the watchdog.
+	defaultStageTimeout = 30 * time.Minute
 )
 
 // doneInstruction is appended to every stage prompt. It defines the completion
@@ -55,8 +62,9 @@ When, and only when, everything above is finished, write ` + stageMarker + ` on 
 
 // buildOptions is one `orch build` invocation.
 type buildOptions struct {
-	task string // the task text, joined from the positional arguments
-	dir  string // repository the agents work in (default: current directory)
+	task         string        // the task text, joined from the positional arguments
+	dir          string        // repository the agents work in (default: current directory)
+	stageTimeout time.Duration // per-stage watchdog; 0 disables it
 }
 
 func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
@@ -109,11 +117,16 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		runDir: runDir,
 		stdout: stdout,
 		stderr: stderr,
-		stage:  interactiveStage(absDir, runDir, stdin, stdout),
+		stage:  interactiveStage(absDir, runDir, stdin, stdout, opts.stageTimeout),
 	}
 	b.verify = b.verifyRepo
 
 	b.logf("artifacts: %s", runDir)
+	if opts.stageTimeout > 0 {
+		b.logf("stage timeout: %s", opts.stageTimeout)
+	} else {
+		b.logf("stage timeout: disabled")
+	}
 	if err := b.build(opts.task); err != nil {
 		fmt.Fprintf(stderr, "orch: build: %v\n", err)
 		return 1
@@ -125,7 +138,7 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 // parseBuildArgs reads orch's flags; the remaining positional arguments are
 // joined into the task so both a single quoted task and bare words work.
 func parseBuildArgs(args []string) (buildOptions, error) {
-	var opts buildOptions
+	opts := buildOptions{stageTimeout: defaultStageTimeout}
 	var words []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -145,6 +158,12 @@ func parseBuildArgs(args []string) (buildOptions, error) {
 			return opts, errHelp
 		case "-C", "--dir":
 			opts.dir, i, err = flagValue(args, i, name, value, hasValue)
+		case "--stage-timeout":
+			var raw string
+			raw, i, err = flagValue(args, i, name, value, hasValue)
+			if err == nil {
+				opts.stageTimeout, err = parseStageTimeout(raw)
+			}
 		default:
 			return opts, fmt.Errorf("unknown flag %q for build", arg)
 		}
@@ -154,6 +173,19 @@ func parseBuildArgs(args []string) (buildOptions, error) {
 	}
 	opts.task = strings.TrimSpace(strings.Join(words, " "))
 	return opts, nil
+}
+
+// parseStageTimeout parses the per-stage watchdog duration. A zero duration is
+// valid and disables the watchdog; a negative one is a usage error.
+func parseStageTimeout(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --stage-timeout %q: %w", s, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("invalid --stage-timeout %q: must not be negative", s)
+	}
+	return d, nil
 }
 
 // builder drives one build run. The agent session and the verification pass are
@@ -263,6 +295,11 @@ func reviewApproved(review string) bool {
 	return strings.EqualFold(matches[len(matches)-1][1], "APPROVED")
 }
 
+// errStageTimeout marks a stage the watchdog had to end. It is a distinct
+// sentinel so callers can tell a liveness failure from an agent error, and the
+// build workflow can report the run as timed out.
+var errStageTimeout = errors.New("stage timed out")
+
 // interactiveStage is the production stage runner: it launches the agent on a
 // real pty, tees the terminal transcript to <name>.log, then reads back the
 // Markdown artifact the agent was asked to write.
@@ -272,7 +309,12 @@ func reviewApproved(review string) bool {
 // orch instead watches the artifact for the stage's completion marker and ends
 // the session once it appears; that keeps native permission prompts in place
 // while the agent works and only stops it after the stage is actually done.
-func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func(string, string, string) (string, error) {
+//
+// A stage that neither completes nor exits is the other way to block forever —
+// a wedged prompt, a hang, an agent that quietly stopped working. The watchdog
+// (timeout > 0) ends that session too, marks the stage timed out on disk, and
+// returns errStageTimeout, which aborts the run so no later stage starts.
+func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer, timeout time.Duration) func(string, string, string) (string, error) {
 	return func(agentName, name, prompt string) (string, error) {
 		a, ok := lookupAgent(agentName)
 		if !ok {
@@ -292,19 +334,37 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func
 
 		artifact := filepath.Join(runDir, name+".md")
 
-		// Wait for the artifact to carry the completion marker, then close stop
-		// so Run ends the session. completed records that orch — not the agent
-		// quitting on its own — ended the stage, so the exit code is not a
-		// failure.
+		// The artifact watcher and the watchdog both want to end the session;
+		// endOnce makes sure the Stop channel is closed exactly once whichever
+		// fires first. completed/timedOut record which reason won so the exit
+		// code can be interpreted correctly afterwards.
 		stop := make(chan struct{})
 		sessionDone := make(chan struct{})
 		completed := make(chan struct{})
+		timedOut := make(chan struct{})
+
+		var endOnce sync.Once
+		endSession := func() { endOnce.Do(func() { close(stop) }) }
+
 		go func() {
-			defer close(stop)
 			if waitForArtifact(artifact, sessionDone) {
 				close(completed)
 			}
+			endSession()
 		}()
+
+		if timeout > 0 {
+			go func() {
+				timer := time.NewTimer(timeout)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					close(timedOut)
+					endSession()
+				case <-sessionDone:
+				}
+			}()
+		}
 
 		code, err := Run(argv, Options{
 			Dir:    dir,
@@ -320,6 +380,12 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func
 		select {
 		case <-completed:
 			// orch ended the session once the artifact was complete.
+		case <-timedOut:
+			// Best effort: the timeout error below is the outcome that matters,
+			// and a missing marker must not mask it.
+			_ = os.WriteFile(timeoutMarkerPath(runDir, name),
+				[]byte(fmt.Sprintf("%s did not finish within %s\n", name, timeout)), 0o644)
+			return "", fmt.Errorf("stage %s (%s) did not finish within %s: %w", name, agentName, timeout, errStageTimeout)
 		default:
 			if code != 0 {
 				return "", fmt.Errorf("exited with code %d", code)
@@ -332,6 +398,12 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer) func
 		}
 		return stripStageMarker(string(text)), nil
 	}
+}
+
+// timeoutMarkerPath is where a timed-out stage records that it was ended by the
+// watchdog, so `orch status` can report the run as timed out.
+func timeoutMarkerPath(runDir, name string) string {
+	return filepath.Join(runDir, name+".timeout")
 }
 
 // waitForArtifact polls the stage artifact until it ends with the completion

@@ -1,9 +1,25 @@
 # Taste
 - When asked to build something, wants it implemented directly in the repository — create and write the actual files; do not just explain or output code snippets. Confidence: 0.85
-- For Go work, expects the standard verification pass after implementing: `gofmt`, `go vet ./...`, `go test ./...`, and fixing any errors found. Confidence: 0.8
+- For Go work, expects the standard verification pass after implementing: `gofmt`, `go mod tidy`, `go vet ./...`, `go test ./...`, and `go test -race ./...`, fixing any errors found. Confidence: 0.8
 - Expects tests to be added for new logic where practical, rather than shipping features untested. Confidence: 0.7
 - Prefers minimal architecture: keep the design small and avoid unnecessary machinery or dependencies (YAGNI-style). Confidence: 0.8
 - Comfortable with macOS-specific (darwin-only) implementations when the task is macOS-focused, rather than portability for its own sake. Confidence: 0.7
-- Never bypass, auto-approve, or suppress permission prompts/checks; interactively-surfaced approvals should remain in force. Confidence: 0.75
+- Never bypass, auto-approve, or suppress permission prompts/checks; interactively-surfaced approvals should remain in force. Confidence: 0.8
 - Prefers changes that extend existing working code rather than rewriting it: inspect the current implementation first and only change what the fix requires. Confidence: 0.7
-- After completing a bug fix, wants a concise end-of-task summary covering the root cause, files changed, the mechanism/approach, and the tests run. Confidence: 0.6
+- After completing a bug fix, wants a concise end-of-task summary covering the root cause, files changed, the mechanism/approach, and the tests run. For hardening/refactor tasks this report should also list the concrete changes made and any remaining limitations/known constraints. Confidence: 0.65
+- Prefers new CLI/feature work to be additive and backward compatible: existing commands, flags, and behavior must keep working unchanged. Confidence: 0.7
+- Wants tests to cover error paths and invalid inputs (e.g. malformed arguments, unknown ids, path traversal), not just the happy path. Confidence: 0.65
+- Scopes changes narrowly: don't touch working subsystems (e.g. PTY execution, workflow semantics, agent implementations) or unrelated files/tooling config directories (e.g. `.commandcode/*`) unless the task requires it. Confidence: 0.7
+- Prefers conservative, non-destructive Git operations: don't reset, revert, amend, rebase, force-push, or delete existing commits, and don't discard working-tree changes, unless explicitly asked. Confidence: 0.7
+- Doesn't want commits created as part of a task unless a commit is explicitly requested. Confidence: 0.6
+- For audit/review tasks, expects an investigation-only pass: inspect the code and run read-only checks without modifying any files. Confidence: 0.8
+- Finds must be grounded in the actual repository and reference specific files/functions; explicitly rejects generic language-agnostic best-practice advice. Confidence: 0.75
+- When given a review/audit, wants findings prioritized by severity (e.g. P0-P3) with current behavior, impact, a concrete recommendation, and a dependency-ordered implementation roadmap. Confidence: 0.65
+- For Git-state/cleanup work, expects an investigation-first approach that distinguishes what's already committed (HEAD) from uncommitted changes, and a closing `git diff` + `git status` summary of exactly what remains modified/untracked. Confidence: 0.6
+- Prefers minimal/loose Go version directives: use the shortest valid version (e.g. `go 1.25`) rather than a specific patch release (e.g. `go 1.25.6`) unless a concrete reason requires the patch. Confidence: 0.7
+- For hardening/refactor/cleanup tasks, expects runtime behavior to be preserved — changes should be non-behavioral and docs updated to stay accurate unless the task explicitly asks otherwise. Confidence: 0.7
+- Before editing code, wants a concrete plan first: inspect the current code and explain exactly what will change (and why) before making any edits. Confidence: 0.7
+- For concurrency/lifecycle work (timeouts, cancellation, shutdown), wants tests to cover both the normal path and resource cleanup — verifying goroutines/processes are not leaked, where practical. Confidence: 0.6
+- For security/validation work (denylists, allowlists, input gating), wants fail-closed behavior and defense in depth: never weaken or remove existing checks, and ensure legitimate inputs are not blocked by over-broad rules (e.g. a prompt mentioning a blocked flag is data, not a flag). Confidence: 0.7
+- Wants validation logic to inspect the actual parsed inputs (normalized CLI arguments) rather than raw/substring text, handling `--flag value`, `--flag=value`, and clustered short forms. Confidence: 0.65
+- For validation/gating features, wants table-driven matrix tests covering every supported target (each agent × every blocked case) plus tests proving legitimate usage still passes. Confidence: 0.7

@@ -4,16 +4,16 @@ A minimal Go CLI orchestrator that runs coding agents in real pseudo-terminals (
 
 ## Features & Philosophy
 
-- **Real PTYs & Raw Mode:** Each agent process gets its own controlling pseudo-terminal sized to your terminal window, forwarding keystrokes and handling window resizes (`SIGWINCH`).
+- **Portable Terminals:** Pty handling uses `creack/pty` and raw mode uses `golang.org/x/term`, so each agent's real terminal UI and resize handling (`SIGWINCH`) work on macOS and Linux.
 - **Zero Permission Bypass:** `orch` adds no approval-skipping flags and refuses to forward any bypass flags passed after `--`. Native permission prompts are always preserved and answered interactively.
 - **Sequential Execution:** Agents run one after another, each owning the terminal. If an agent exits with a non-zero code, subsequent agents are skipped and `orch` halts immediately with that code.
-- **Darwin Optimized:** Terminal raw mode is implemented natively for macOS (`darwin`) via standard library `syscall` ioctls, requiring only a single dependency (`creack/pty`).
+- **Liveness Watchdog:** Each build stage has a configurable timeout. A stage that stops making progress is terminated cleanly and the run stops there instead of waiting forever.
 
 ## Prerequisites & Building
 
-- **Go:** Go 1.25.6+ (from `go.mod`).
-- **Platform:** macOS (darwin) for interactive full-screen agent UIs. On non-darwin platforms (`term_other.go`), raw mode is not implemented (`errNoRawMode`); the terminal is left untouched, which allows non-interactive or piped execution but will not drive full-screen interactive UIs properly.
-- **Dependencies:** `github.com/creack/pty v1.1.24` (module `orch`).
+- **Go:** Go 1.25+ (from `go.mod`).
+- **Platform:** macOS and Linux. Raw mode comes from `golang.org/x/term`, which covers the common Unix targets; non-Unix platforms do not build.
+- **Dependencies:** `github.com/creack/pty v1.1.24` and `golang.org/x/term v0.45.0` (module `github.com/raihannajmi/orch-go`).
 - **Agents:** The binaries for agents you wish to run must be installed and available on `$PATH`.
 
 ### Building from Source
@@ -34,19 +34,17 @@ The agent registry is defined in `agent.go`:
 
 ### Permission Safety Guarantees
 
-`orch` strictly enforces that no permissions are bypassed or auto-approved. It never injects approval-skipping flags, and `checkPermissionFlags` blocks any attempt to pass the following flags via `--`:
+`orch` strictly enforces that no permissions are bypassed or auto-approved. It never injects approval-skipping flags, and every argument the agent's parser could read as a flag is checked against a denylist before launch. The boundary has two gates:
 
-- **Shared Denied Flags:**
-  - `--dangerously-skip-permissions`
-  - `--yolo`
-  - `--auto-accept`
-  - `--tools-all`
-  - `--permission-mode auto-accept` / `--permission-mode accept-all`
-  - `--mode accept-edits`
-- **Agent-Specific Denied Flags:**
-  - `command-code`: `--trust`, `-t`
+- **Per-agent allowlist:** the only flags `orch` itself may place on the command line are those an agent declares (`--continue`, and the prompt flag). `buildArgv` fails closed if it would emit anything else, so a bad registry entry cannot silently weaken a session.
+- **Bypass denylist:** the user's pass-through arguments are refused when they name a permission-suppressing flag. Both `--flag value` and `--flag=value` spellings are handled, values are matched case-insensitively, and single-dash clusters are expanded (`-cy` is caught as `continue` + `yolo`). Scanning stops at `--`, after which arguments are positional for the agent.
+- **Text is not a flag:** a prompt carried as a flag value (agy, copilot) is data and is never scanned; only a positional prompt (command-code) is checked, because there the agent's own parser would read a leading `-` as a flag.
 
-Both `--flag value` and `--flag=value` syntaxes are checked and rejected.
+Blocked flags include:
+
+- **Outright:** `--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--skip-permissions`, `--bypass-permissions`, `--yolo` / `-y`, `--auto-accept`, `--auto-accept-all`, `--auto-approve`, `--always-approve`, `--accept-edits`, `--accept-all`, `--allow-all`, `--allow-all-tools`, `--allow-all-paths`, `--tools-all`, `--trust`, `--full-auto`.
+- **By value:** `--permission-mode`, `--approval-mode`, `--mode`, `--sandbox` are refused when set to a suppressing value (`auto-accept`, `accept-edits`, `bypassPermissions`, `yolo`, `none`, …). Safe values such as `default`, `plan` and `standard` still pass.
+- **Agent-specific:** `command-code`: `-t` (short form of `--trust`).
 
 ## CLI Reference
 
@@ -106,9 +104,13 @@ Executes an automated multi-stage build workflow combining planning, plan review
 
 **Flags:**
 - `-C, --dir <path>`: Repository directory where agents work (default: current directory).
+- `--stage-timeout <duration>`: End a stage that makes no progress for this long, e.g. `--stage-timeout 45m` (default `30m`; `0` disables the watchdog).
 
 **Stage Completion Signal:**
 Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
+
+**Stage Timeout:**
+If a stage neither writes its marker nor exits within the per-stage timeout, the watchdog ends that session the same way (SIGTERM, then SIGKILL), records `<stage>.timeout` in the run directory, and stops the run — no later stage starts. This is the guard against a wedged prompt or a hung tool call blocking the workflow forever.
 
 **Artifacts Directory:**
 Every run creates a timestamped directory under `.orch/<run-id>/` containing Markdown reports and raw terminal transcripts:
@@ -129,16 +131,16 @@ If changes are requested, subsequent fix and review cycles continue numbering se
 
 ### `orch status`
 
-Lists the workflow runs recorded under `.orch/`, newest first, with each run's stage count and the verdict of its final review (`APPROVED`, `REJECTED`, or `-` when no review artifact exists). A missing `.orch/` is not an error; it reports that no runs exist yet.
+Lists the workflow runs recorded under `.orch/`, newest first, with each run's stage count, the verdict of its final review (`APPROVED`, `REJECTED`, or `-` when no review artifact exists), and the stage a watchdog ended (`-` unless the run timed out). A missing `.orch/` is not an error; it reports that no runs exist yet.
 
 ```sh
 orch status
 ```
 
 ```
-RUN-ID            STAGES  VERDICT
-20260921-180819        4  APPROVED
-20260921-170242        4  APPROVED
+RUN-ID            STAGES  VERDICT   TIMED OUT
+20260921-180819        4  APPROVED  -
+20260921-170242        4  -         3-implement
 ```
 
 ### `orch logs <run-id>`

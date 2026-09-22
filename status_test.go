@@ -246,3 +246,40 @@ func TestOrchMainStatusLogs(t *testing.T) {
 		t.Errorf("logs output = %q, want the artifact listing", stdout.String())
 	}
 }
+
+// TestListRunsReportsTimeout covers the watchdog's on-disk marker: a run whose
+// stage was ended by the timeout must be reported as timed out at that stage.
+func TestListRunsReportsTimeout(t *testing.T) {
+	state := t.TempDir()
+	writeRun(t, state, "20260101-120000", map[string]string{
+		"1-plan.md":           "plan",
+		"3-implement.md":      "implementation",
+		"3-implement.timeout": "did not finish\n",
+	})
+
+	runs, err := listRuns(state)
+	if err != nil {
+		t.Fatalf("listRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].timedOut != "3-implement" {
+		t.Errorf("runs = %+v, want one run timed out at 3-implement", runs)
+	}
+}
+
+// TestCmdStatusShowsTimeout checks the timed-out stage reaches the status table.
+func TestCmdStatusShowsTimeout(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeRun(t, filepath.Join(dir, buildStateDir), "20260101-120000", map[string]string{
+		"1-plan.md":           "plan",
+		"3-implement.timeout": "did not finish\n",
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdStatus(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdStatus = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "3-implement") {
+		t.Errorf("status does not report the timed-out stage:\n%s", stdout.String())
+	}
+}

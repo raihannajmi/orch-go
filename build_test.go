@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -190,7 +196,7 @@ func TestInteractiveStageReadsArtifact(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	stage := interactiveStage(dir, runDir, nil, io.Discard)
+	stage := interactiveStage(dir, runDir, nil, io.Discard, defaultStageTimeout)
 	text, err := stage("agy", "1-plan", "prompt")
 	if err != nil {
 		t.Fatalf("stage: %v", err)
@@ -215,7 +221,7 @@ func TestInteractiveStageMissingArtifact(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	stage := interactiveStage(dir, runDir, nil, io.Discard)
+	stage := interactiveStage(dir, runDir, nil, io.Discard, defaultStageTimeout)
 	if _, err := stage("agy", "1-plan", "prompt"); err == nil {
 		t.Fatal("stage = nil error, want a missing-artifact error")
 	}
@@ -241,7 +247,9 @@ func TestInteractiveStageEndsLingeringAgent(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	stage := interactiveStage(dir, runDir, nil, io.Discard)
+	// A generous watchdog: this stage completes well before it, proving the
+	// timeout does not disturb the normal completion path.
+	stage := interactiveStage(dir, runDir, nil, io.Discard, 30*time.Second)
 
 	type result struct {
 		text string
@@ -325,5 +333,157 @@ func TestStagePromptsRequireMarker(t *testing.T) {
 		if !strings.Contains(p, stageMarker) {
 			t.Errorf("%s prompt does not require the completion marker", name)
 		}
+	}
+}
+
+// TestInteractiveStageTimesOut is the regression test for a wedged stage: an
+// agent that neither writes its completion marker nor exits must be ended by the
+// watchdog, not waited on forever. It also checks the cleanup: the timeout is
+// recorded for `orch status`, the agent process is reaped, and the goroutines
+// the stage started are all gone.
+func TestInteractiveStageTimesOut(t *testing.T) {
+	dir := t.TempDir()
+	runDir := t.TempDir()
+
+	binDir := t.TempDir()
+	pidFile := filepath.Join(dir, "agent.pid")
+	// Stand-in agent: record its pid, never write the artifact, never exit —
+	// the shape of a wedged prompt or a hung tool call.
+	script := "#!/bin/sh\necho $$ > '" + pidFile + "'\nsleep 3600\n"
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write stand-in agent: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	warmSignalLoop()
+	before := runtime.NumGoroutine()
+	stage := interactiveStage(dir, runDir, nil, io.Discard, time.Second)
+
+	start := time.Now()
+	_, err := stage("agy", "1-plan", "prompt")
+	if !errors.Is(err, errStageTimeout) {
+		t.Fatalf("stage error = %v, want errStageTimeout", err)
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Errorf("stage took %s, want the watchdog to end it promptly", d)
+	}
+
+	if _, statErr := os.Stat(timeoutMarkerPath(runDir, "1-plan")); statErr != nil {
+		t.Errorf("timeout marker not written: %v", statErr)
+	}
+
+	if pid := readPID(t, pidFile); processAlive(pid) {
+		t.Errorf("agent process %d is still alive after the timeout", pid)
+	}
+
+	waitForGoroutines(t, before)
+}
+
+// TestBuildStopsAfterStageTimeout covers cancellation: once a stage times out,
+// the workflow must stop rather than start the next one.
+func TestBuildStopsAfterStageTimeout(t *testing.T) {
+	b, calls, _, verifications := fakeBuilder(t, 1)
+
+	inner := b.stage
+	b.stage = func(agentName, name, prompt string) (string, error) {
+		if name == "1-plan" {
+			*calls = append(*calls, name)
+			return "", fmt.Errorf("stage %s: %w", name, errStageTimeout)
+		}
+		return inner(agentName, name, prompt)
+	}
+
+	err := b.build("do the thing")
+	if !errors.Is(err, errStageTimeout) {
+		t.Fatalf("build error = %v, want errStageTimeout", err)
+	}
+	if want := "1-plan"; strings.Join(*calls, ",") != want {
+		t.Errorf("stages = %v, want only %q (no stage may start after a timeout)", *calls, want)
+	}
+	if *verifications != 0 {
+		t.Errorf("verification ran %d times, want 0 after a timeout", *verifications)
+	}
+}
+
+func TestParseBuildArgsStageTimeout(t *testing.T) {
+	opts, err := parseBuildArgs([]string{"task"})
+	if err != nil {
+		t.Fatalf("parseBuildArgs: %v", err)
+	}
+	if opts.stageTimeout != defaultStageTimeout {
+		t.Errorf("default stage timeout = %s, want %s", opts.stageTimeout, defaultStageTimeout)
+	}
+
+	if opts, err = parseBuildArgs([]string{"--stage-timeout", "45s", "task"}); err != nil {
+		t.Fatalf("parseBuildArgs: %v", err)
+	}
+	if opts.stageTimeout != 45*time.Second {
+		t.Errorf("stage timeout = %s, want 45s", opts.stageTimeout)
+	}
+
+	if opts, err = parseBuildArgs([]string{"--stage-timeout=0", "task"}); err != nil {
+		t.Fatalf("parseBuildArgs: %v", err)
+	}
+	if opts.stageTimeout != 0 {
+		t.Errorf("stage timeout = %s, want 0 (disabled)", opts.stageTimeout)
+	}
+
+	for _, args := range [][]string{
+		{"--stage-timeout", "nope", "task"},
+		{"--stage-timeout", "-5s", "task"},
+		{"--stage-timeout"},
+	} {
+		if _, err := parseBuildArgs(args); err == nil {
+			t.Errorf("parseBuildArgs(%q) = nil error, want a usage error", args)
+		}
+	}
+}
+
+// readPID waits for the stand-in agent to record its pid.
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(b))); convErr == nil {
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent did not record its pid in %s", path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// processAlive reports whether pid still exists.
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+// warmSignalLoop starts the process-wide os/signal watcher once, so a goroutine
+// baseline taken afterwards is not inflated by the first Run that calls
+// signal.Notify. The watcher goroutine is created once and never stops.
+func warmSignalLoop() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Stop(ch)
+}
+
+// waitForGoroutines waits for the goroutine count to fall back to want, failing
+// if it does not: a session that leaves a reader or a watcher behind shows up
+// here.
+func waitForGoroutines(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := runtime.NumGoroutine(); got <= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("goroutines leaked: %d still running, want <= %d", runtime.NumGoroutine(), want)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
