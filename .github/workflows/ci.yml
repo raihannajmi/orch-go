@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Linux and macOS: orch's supported platforms. Same checks on both, so they
+  # are one matrix. The Go version comes from the go directive in go.mod.
+  unix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reported files that need formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+  # Windows is NOT a supported target: orch drives real Unix pseudo-terminals
+  # (syscall.Kill/SIGWINCH, golang.org/x/sys/unix), so the module does not
+  # compile on Windows and there is no interactive PTY support to test. This gate
+  # asserts that honest state rather than pretending support exists: it passes
+  # only while the Windows build fails, and fails the day the build succeeds so
+  # the matrix and README get updated instead of silently drifting.
+  windows:
+    name: "windows (build gate: unsupported)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Windows is not a supported build target
+        shell: bash
+        run: |
+          if go build ./... 2>build.err; then
+            echo "::error::orch now builds on Windows; promote this job to a real build/test gate and update the README."
+            exit 1
+          fi
+          echo "orch does not build on Windows, as expected for a Unix-only tool. Build output:"
+          cat build.err

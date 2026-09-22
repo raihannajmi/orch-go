@@ -23,3 +23,7 @@
 - For security/validation work (denylists, allowlists, input gating), wants fail-closed behavior and defense in depth: never weaken or remove existing checks, and ensure legitimate inputs are not blocked by over-broad rules (e.g. a prompt mentioning a blocked flag is data, not a flag). Confidence: 0.7
 - Wants validation logic to inspect the actual parsed inputs (normalized CLI arguments) rather than raw/substring text, handling `--flag value`, `--flag=value`, and clustered short forms. Confidence: 0.65
 - For validation/gating features, wants table-driven matrix tests covering every supported target (each agent × every blocked case) plus tests proving legitimate usage still passes. Confidence: 0.7
+- Wants honesty about platform limitations: never claim or fake support for platforms the implementation doesn't actually support (e.g. a build gate that asserts the honest unsupported state rather than a passing build pretending support exists). Confidence: 0.7
+- For CI setup, wants the workflow kept simple and maintainable — minimal jobs/steps and no unnecessary machinery. Confidence: 0.6
+- For CI, wants the Go toolchain version sourced from go.mod (e.g. `go-version-file: go.mod`) and dependency caching enabled, rather than hardcoding a version. Confidence: 0.6
+- After writing config files (e.g. workflow YAML), wants their syntax validated where practical before reporting done. Confidence: 0.55
