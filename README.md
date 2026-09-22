@@ -130,6 +130,12 @@ orch build "fix the parser" --verify "make lint" --verify "make test"
 orch build "harden the auth boundary" -C ~/src/app --verify "pytest -q"
 ```
 
+### Concurrency and artifact permissions
+
+Only one mutating workflow runs against a repository at a time. `orch build` and `orch resume` take a repository-level lock at `.orch/workflow.lock` (an OS `flock`, held for the whole workflow and released on completion, failure, or process death). A second build or resume in the same repository is refused with a clear message instead of racing the first on the working tree. Read-only commands (`orch status`, `orch logs`) do not take the lock. Independent repositories lock independently and can run concurrently. Lock order is always repository lock first, then the per-run lock (`.orch/<run-id>/run.lock`), so the two can never deadlock.
+
+Runtime artifacts under `.orch/` are owner-only: the `.orch` directory and new run directories are `0700`, and the state (`run.json`), lock files, transcripts (`.log`), stage artifacts (`.md`) and `verify.log` are `0600`. This keeps prompts, transcripts and agent output private on shared machines. Existing artifacts are never re-permissioned, and `status`/`logs` keep reading runs created before this change.
+
 **Stage Completion Signal:**
 Every stage is an interactive session, so after finishing its work the agent stays at its prompt. To avoid waiting on that prompt forever, each stage prompt requires the agent to write `ORCH_STAGE_COMPLETE` on a line by itself as the final line of its artifact. `orch` polls the artifact for that marker and cleanly ends the session (SIGTERM, then SIGKILL after a grace period) once it appears — so permission prompts stay available while the agent works, and the workflow continues automatically when the stage is done.
 

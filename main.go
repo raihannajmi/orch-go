@@ -84,35 +84,43 @@ func cmdRun(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// Resolve every agent up front so a typo in the second one cannot leave the
-	// first one's session already started.
+	// Resolve and validate every agent command line before touching the system.
+	// Argument validation (the permission-bypass denylist) must not depend on the
+	// agent being installed, so every plan entry is checked first: a forbidden
+	// flag is rejected with exit 2 even when the binary is missing. Only once the
+	// whole plan is valid do we require the binaries, so a missing one still fails
+	// fast with 127 rather than after a session has already started.
 	plan := make([]Agent, 0, len(opts.agents))
+	argvs := make([][]string, 0, len(opts.agents))
 	for _, name := range opts.agents {
 		a, ok := lookupAgent(name)
 		if !ok {
 			fmt.Fprintf(stderr, "orch: unknown agent %q (see `orch list`)\n", name)
 			return 2
 		}
-		if _, err := exec.LookPath(a.Bin); err != nil {
-			fmt.Fprintf(stderr, "orch: %s is not on PATH; install %s first\n", a.Bin, a.Name)
-			return 127
-		}
-		plan = append(plan, a)
-	}
-
-	// Agents run one after another, each owning the terminal. A non-zero exit
-	// stops the chain and becomes orch's exit code.
-	for i, a := range plan {
 		argv, err := buildArgv(a, opts)
 		if err != nil {
 			fmt.Fprintf(stderr, "orch: %v\n", err)
 			return 2
 		}
+		plan = append(plan, a)
+		argvs = append(argvs, argv)
+	}
+	for _, a := range plan {
+		if _, err := exec.LookPath(a.Bin); err != nil {
+			fmt.Fprintf(stderr, "orch: %s is not on PATH; install %s first\n", a.Bin, a.Name)
+			return 127
+		}
+	}
+
+	// Agents run one after another, each owning the terminal. A non-zero exit
+	// stops the chain and becomes orch's exit code.
+	for i, a := range plan {
 		if len(plan) > 1 {
 			fmt.Fprintf(stderr, "orch: [%d/%d] %s\n", i+1, len(plan), a.Name)
 		}
 
-		code, err := Run(argv, Options{Dir: opts.dir, Stdin: stdin, Stdout: stdout})
+		code, err := Run(argvs[i], Options{Dir: opts.dir, Stdin: stdin, Stdout: stdout})
 		if err != nil {
 			fmt.Fprintf(stderr, "orch: %s: %v\n", a.Name, err)
 			return 1
@@ -284,5 +292,7 @@ A stage that stops making progress is ended by a per-stage watchdog (see
 --stage-timeout) and the run stops there instead of waiting forever.
 The run finishes with the verification commands (see Verification above),
 auto-detected and overridable with --verify.
+Only one build or resume runs per repository at a time; a second is refused.
+Runtime artifacts under .orch/ are owner-only (dirs 0700, files 0600).
 `)
 }

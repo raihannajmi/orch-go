@@ -21,9 +21,10 @@ import (
 // records the things the artifacts alone cannot express: the task text, the
 // repository, the progress cursor and the terminal outcome.
 const (
-	runStateFile    = "run.json"
-	runLockFile     = "run.lock"
-	runStateVersion = 1
+	runStateFile     = "run.json"
+	runLockFile      = "run.lock"
+	workflowLockFile = "workflow.lock"
+	runStateVersion  = 1
 )
 
 // Run-level states. running is the only non-terminal one; interrupted is derived
@@ -95,6 +96,13 @@ func writeRunState(runDir string, st runState) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	// CreateTemp already opens 0600; set it explicitly so the state file's mode
+	// does not depend on the platform's default.
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
 	if _, err := tmp.Write(b); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -125,12 +133,20 @@ func readRunState(runDir string) (runState, error) {
 	return st, nil
 }
 
+// ensureStateDir creates the .orch state directory with owner-only
+// permissions. It never tightens an existing directory, so pre-existing
+// artifacts keep whatever access they already had.
+func ensureStateDir(stateDir string) error {
+	return os.MkdirAll(stateDir, 0o700)
+}
+
 // createRunDir makes a fresh run directory under stateDir. The id keeps the
 // timestamp form so existing ids and `orch status` ordering are unchanged, but a
 // same-second collision gets a numeric suffix instead of silently sharing a
 // directory: Mkdir fails on an existing name, which the old MkdirAll masked.
+// New run directories are owner-only; existing ones are left untouched.
 func createRunDir(stateDir string) (id, dir string, err error) {
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := ensureStateDir(stateDir); err != nil {
 		return "", "", err
 	}
 	base := time.Now().Format("20060102-150405")
@@ -140,7 +156,7 @@ func createRunDir(stateDir string) (id, dir string, err error) {
 			id = fmt.Sprintf("%s-%d", base, i+1)
 		}
 		dir = filepath.Join(stateDir, id)
-		mkErr := os.Mkdir(dir, 0o755)
+		mkErr := os.Mkdir(dir, 0o700)
 		if mkErr == nil {
 			return id, dir, nil
 		}
@@ -151,16 +167,19 @@ func createRunDir(stateDir string) (id, dir string, err error) {
 	return "", "", fmt.Errorf("could not create a unique run directory named %s", base)
 }
 
-// runLock is an exclusive advisory lock on one run directory. flock is released
-// by the kernel when the owning process dies, so a stale lock never blocks a
-// later resume — a free lock on a run whose state says "running" is exactly how
-// an interrupted run is detected.
+// runLock is an exclusive advisory lock backed by flock, which the kernel
+// releases when the owning process dies. A stale lock therefore never blocks a
+// later run: a free per-run lock on a run whose state says "running" is exactly
+// how an interrupted run is detected, and the repository lock is released even
+// when a build is killed or cancelled.
 type runLock struct{ f *os.File }
 
-// lockRun takes the run's exclusive lock without blocking. It returns
-// errRunLocked when another process holds it.
-func lockRun(runDir string) (*runLock, error) {
-	f, err := os.OpenFile(filepath.Join(runDir, runLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+// lockPath takes an exclusive, non-blocking flock on path, creating the lock
+// file when needed. It returns errRunLocked when another process already holds
+// it. flock is used rather than a PID file precisely because the kernel releases
+// it on process exit, so a crashed or killed process cannot leave a lock behind.
+func lockPath(path string) (*runLock, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +193,21 @@ func lockRun(runDir string) (*runLock, error) {
 	return &runLock{f: f}, nil
 }
 
-// Close releases the run lock.
+// lockRun takes the run's exclusive lock without blocking. It returns
+// errRunLocked when another process holds it.
+func lockRun(runDir string) (*runLock, error) {
+	return lockPath(filepath.Join(runDir, runLockFile))
+}
+
+// lockWorkflow takes the repository-level lock that lets only one mutating
+// workflow (build or resume) operate on a repository at a time. It lives under
+// the repository's .orch directory and returns errRunLocked when another
+// workflow already holds it.
+func lockWorkflow(stateDir string) (*runLock, error) {
+	return lockPath(filepath.Join(stateDir, workflowLockFile))
+}
+
+// Close releases the lock.
 func (l *runLock) Close() error {
 	if l == nil || l.f == nil {
 		return nil

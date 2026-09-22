@@ -58,9 +58,24 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Lock before anything else: a live run must never be resumed underneath its
-	// owner. A free lock on a run whose state says "running" is proof the previous
-	// process died, i.e. the run was interrupted.
+	// Serialize whole workflows per repository, exactly as `orch build` does, and
+	// before the per-run lock. Taking them in this order everywhere (workflow
+	// then run) means a build and a resume can never deadlock against each other.
+	stateDir := filepath.Dir(runDir)
+	workflowLock, err := lockWorkflow(stateDir)
+	if errors.Is(err, errRunLocked) {
+		fmt.Fprintf(stderr, "orch: another orch workflow is already running in this repository; refusing to resume %s concurrently\n", id)
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
+	}
+	defer func() { _ = workflowLock.Close() }()
+
+	// Lock the run itself before anything else: a live run must never be resumed
+	// underneath its owner. A free lock on a run whose state says "running" is
+	// proof the previous process died, i.e. the run was interrupted.
 	lock, err := lockRun(runDir)
 	if errors.Is(err, errRunLocked) {
 		fmt.Fprintf(stderr, "orch: run %s is already in progress; refusing to resume it concurrently\n", id)

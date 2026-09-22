@@ -116,10 +116,30 @@ func cmdBuild(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Serialize whole workflows per repository: only one build or resume may
+	// mutate this repository at a time. The lock is taken before the run
+	// directory exists, so a second invocation is refused without leaving state
+	// behind, and the kernel releases it if this process is killed.
+	stateDir := filepath.Join(absDir, buildStateDir)
+	if err := ensureStateDir(stateDir); err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
+	}
+	workflowLock, err := lockWorkflow(stateDir)
+	if errors.Is(err, errRunLocked) {
+		fmt.Fprintln(stderr, "orch: another orch workflow is already running in this repository (see `orch status`); wait for it to finish before starting another")
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "orch: %v\n", err)
+		return 1
+	}
+	defer func() { _ = workflowLock.Close() }()
+
 	// Create the run directory collision-safely and lock it before touching it,
 	// so a second build in the same second can never race this one into the same
-	// directory. The lock is held for the whole run.
-	stateDir := filepath.Join(absDir, buildStateDir)
+	// directory. Locks are always taken workflow-first then run, so they cannot
+	// deadlock against each other.
 	runID, runDir, err := createRunDir(stateDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "orch: %v\n", err)
@@ -588,14 +608,22 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer, time
 			return "", err
 		}
 
+		// The transcript is potentially sensitive (it echoes the prompt and the
+		// agent's output), so it is opened owner-only.
 		logPath := filepath.Join(runDir, name+".log")
-		log, err := os.Create(logPath)
+		log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			return "", err
 		}
 		defer func() { _ = log.Close() }()
 
 		artifact := filepath.Join(runDir, name+".md")
+		// The agent writes the artifact with its own umask; tighten the run's
+		// files to the private mode on every exit path, including a timeout.
+		defer func() {
+			_ = os.Chmod(artifact, 0o600)
+			_ = os.Chmod(logPath, 0o600)
+		}()
 
 		// The artifact watcher and the watchdog both want to end the session;
 		// endOnce makes sure the Stop channel is closed exactly once whichever
@@ -647,7 +675,7 @@ func interactiveStage(dir, runDir string, stdin *os.File, stdout io.Writer, time
 			// Best effort: the timeout error below is the outcome that matters,
 			// and a missing marker must not mask it.
 			_ = os.WriteFile(timeoutMarkerPath(runDir, name),
-				[]byte(fmt.Sprintf("%s did not finish within %s\n", name, timeout)), 0o644)
+				[]byte(fmt.Sprintf("%s did not finish within %s\n", name, timeout)), 0o600)
 			return "", fmt.Errorf("stage %s (%s) did not finish within %s: %w", name, agentName, timeout, errStageTimeout)
 		default:
 			if code != 0 {
@@ -714,7 +742,7 @@ func stripStageMarker(s string) string {
 // failure. It never uses a shell: each command's argv is executed directly.
 func (b *builder) verifyRepo() error {
 	logPath := filepath.Join(b.runDir, "verify.log")
-	log, err := os.Create(logPath)
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
