@@ -175,8 +175,22 @@ func readRunState(runDir string) (runState, error) {
 // ensureStateDir creates the .orch state directory with owner-only
 // permissions. It never tightens an existing directory, so pre-existing
 // artifacts keep whatever access they already had.
+//
+// A symlinked .orch is refused: orch writes prompts, transcripts and state
+// there, and following a symlink would let an untrusted repository redirect
+// those writes to a directory of the author's choosing.
 func ensureStateDir(stateDir string) error {
-	return os.MkdirAll(stateDir, 0o700)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(stateDir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing to use it for run state", stateDir)
+	}
+	return nil
 }
 
 // createRunDir makes a fresh run directory under stateDir. The id keeps the

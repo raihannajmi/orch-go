@@ -13,7 +13,9 @@ concurrency:
 
 jobs:
   # Linux and macOS: orch's supported platforms. Same checks on both, so they
-  # are one matrix. The Go version comes from the go directive in go.mod.
+  # are one matrix. The go-version input pins the latest patch of the minor in
+  # go.mod's go directive, which is itself a lower bound kept at the Go release
+  # that fixes the standard-library advisory govulncheck reports.
   unix:
     name: ${{ matrix.os }}
     strategy:
@@ -29,7 +31,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.25.x'
           cache: true
 
       - name: gofmt
@@ -44,11 +46,34 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go build
+        run: go build ./...
+
       - name: go test
         run: go test ./...
 
       - name: go test -race
         run: go test -race ./...
+
+  # Vulnerability scan, once rather than per OS. govulncheck is pinned to a
+  # version so the scan is reproducible, and needs no local install (`go run`
+  # keeps it out of the module's own dependencies, and setup-go's module cache
+  # speeds up repeat runs). It fails the job on known vulnerabilities the code is
+  # affected by.
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   # Windows is NOT a supported target: orch drives real Unix pseudo-terminals
   # (syscall.Kill/SIGWINCH, golang.org/x/sys/unix), so the module does not
@@ -65,7 +90,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.25.x'
           cache: true
 
       - name: Windows is not a supported build target
