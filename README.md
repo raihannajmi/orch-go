@@ -10,17 +10,49 @@ A minimal Go CLI orchestrator that runs coding agents in real pseudo-terminals (
 - **Liveness Watchdog:** Each build stage has a configurable timeout. A stage that stops making progress is terminated cleanly and the run stops there instead of waiting forever.
 - **Optional Knowledge Layer:** Best-effort context retrieval and durable capture (Obsidian, Graphify) that never breaks a build or bypasses permissions.
 
-## Prerequisites & Building
+## Prerequisites & Installation
 
-- **Go:** Go 1.25+ (from `go.mod`).
+- **Go:** the `go` directive in `go.mod` (currently `1.25.8`). It is the module's minimum Go version and acts as a toolchain floor — an older local toolchain is upgraded to it automatically — and it is kept at the release that fixes the standard-library advisory `govulncheck` reports for this code. CI builds the latest patch of the same minor (`go-version: '1.25.x'`).
 - **Platform:** macOS and Linux. Raw mode comes from `golang.org/x/term`, which covers the common Unix targets; non-Unix platforms do not build.
 - **Dependencies:** `github.com/creack/pty v1.1.24` and `golang.org/x/term v0.45.0` (module `github.com/raihannajmi/orch-go`).
 - **Agents:** The binaries for agents you wish to run must be installed and available on `$PATH`.
 
-### Building from Source
+### Install from source
 
 ```sh
+go install github.com/raihannajmi/orch-go@latest   # installs `orch` into $(go env GOPATH)/bin
+# or, from a checkout:
 go build -o orch .
+```
+
+Release builds embed the version, commit and date:
+
+```sh
+go build -ldflags "-X main.version=v0.2.0 \
+  -X main.commit=$(git rev-parse --short HEAD) \
+  -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o orch .
+```
+
+`orch version` prints `orch 0.1.0`, and appends the commit and date when they were
+injected. Releases are cut as Git tags (`vX.Y.Z`) on `main`; there is no separate
+release framework to learn.
+
+### Quick start
+
+```sh
+orch list                              # agents orch knows, and which are installed
+orch run agy                           # launch agy in a real terminal, permissions intact
+orch run command-code -p "summarise this repository"
+```
+
+For an unattended workflow in a repository orch can verify (it has a `go.mod`,
+`Cargo.toml`, or a `package.json` with a test/lint script):
+
+```sh
+orch build "add a --json flag to the report command"   # plan, review, implement, review, verify
+orch status                                            # runs under .orch/, newest first
+orch logs 20260101-120000                              # one run's reports and transcripts
+orch resume 20260101-120000                            # continue an interrupted run
 ```
 
 ## Supported Agents
@@ -208,10 +240,10 @@ The first backend is Obsidian, configured by environment (the CLI stays a single
 | `ORCH_KNOWLEDGE_GRAPH` | `graph.json` to query (default: `<vault>/graphify-out/graph.json`) |
 
 ```sh
-ORCH_KNOWLEDGE_VAULT=~/Obsidian/najmiraihan orch build "harden the auth boundary" --knowledge
+ORCH_KNOWLEDGE_VAULT=~/Obsidian/myvault orch build "harden the auth boundary" --knowledge
 
 # with the optional Graphify enrichment layer
-ORCH_KNOWLEDGE_VAULT=~/Obsidian/najmiraihan ORCH_KNOWLEDGE_GRAPHIFY=1 \
+ORCH_KNOWLEDGE_VAULT=~/Obsidian/myvault ORCH_KNOWLEDGE_GRAPHIFY=1 \
   orch build "harden the auth boundary" --knowledge
 ```
 
@@ -253,9 +285,37 @@ artifacts in .orch/20260921-180819:
   verify.log             19 B
 ```
 
+### `orch resume <run-id>`
+
+Resumes an interrupted or failed run from its first incomplete stage, skipping the
+stages whose artifacts already end with the completion marker. A live run is never
+resumed underneath its owner: `resume` takes the same repository lock as `build`,
+and re-runs an agent stage exactly as `build` would — interactively, with the
+agent's native permission prompts.
+
+```sh
+orch resume 20260101-120000
+```
+
+Recovery is deliberately conservative. `orch` never resets, checks out, cleans or
+stashes, and when the repository is not safe to continue it refuses rather than
+touching your work:
+
+- if `HEAD` moved since the run started, `resume` refuses so your commits are not disturbed;
+- if the tree is dirty but no stage of the run could have changed it, `resume` refuses rather than continuing on an unexpected tree;
+- an interrupted `-implement`/`-fix` stage is re-run as-is — changes it already made are **not** rolled back, and `orch` says so rather than implying a clean slate.
+
+A run whose stages are all complete but whose verification failed resumes by
+re-running verification, with the same commands the run recorded. Runs created
+before `run.json` existed stay readable with `orch status`/`orch logs` but cannot
+be resumed; `resume` reports that instead of guessing. As with `build`, `--json`
+is supported.
+
 ### `orch version` (aliases: `-v`, `--version`)
 
-Prints the current version (`orch 0.1.0`).
+Prints the current version (`orch 0.1.0`). When a release build injects them via
+`-ldflags` (see [Install from source](#install-from-source)), the commit and date
+are appended, e.g. `orch 0.2.0 (1a2b3c4, 2026-09-22T10:00:00Z)`.
 
 ### `orch help` (aliases: `-h`, `--help`)
 
@@ -270,3 +330,32 @@ Prints CLI usage instructions, agent registry summaries, and flag references.
 | `2` | Command-line usage error, unknown command or agent, missing flag argument, or multiple agents specified with `--` pass-through args. (`orch` with no arguments prints usage to `stderr` and exits with `2`). |
 | `127` | Required agent binary not found on `$PATH`. |
 | `>0` / `128+N` | Exit status propagated directly from the agent process, following standard shell conventions (or `128 + signal` if killed by signal). |
+
+## Security
+
+What orch guarantees — no permission bypass, no shell, private `0700`/`0600`
+artifacts, a symlinked `.orch` is refused, no destructive git — and its known
+exposure (the command line is visible in `ps`; transcripts capture agent output)
+are documented in [SECURITY.md](SECURITY.md). Report vulnerabilities privately
+rather than in a public issue.
+
+Dependencies and the standard library are scanned with `govulncheck` in CI, which
+fails on known vulnerabilities the code is affected by. The module's minimum Go
+version is kept at the release that fixes the standard-library advisory the
+scanner reports for this code, so an older toolchain is upgraded rather than
+built against it.
+
+## Development & Contributing
+
+```sh
+go build ./... ; go test ./... ; go test -race ./... ; go vet ./... ; gofmt -l .
+go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full checklist and the rules the
+code keeps. Bug reports use the issue template; dependency updates arrive via
+Dependabot and are reviewed and merged by a human, never automatically.
+
+## License
+
+[MIT](LICENSE).
