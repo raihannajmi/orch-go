@@ -14,10 +14,35 @@ import (
 	"strings"
 )
 
-const version = "0.1.0"
+// Build metadata. version is the release version; commit and date are injected
+// at build time (for example with
+// -ldflags "-X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+// and stay empty for a plain `go build`, so `orch version` keeps its simple
+// "orch <version>" output unless the metadata is present.
+var (
+	version = "0.1.0"
+	commit  = ""
+	date    = ""
+)
 
 // errHelp lets flag parsing unwind back to a usage message.
 var errHelp = errors.New("help requested")
+
+// versionString renders the version, with build metadata appended when it was
+// injected.
+func versionString() string {
+	if commit == "" && date == "" {
+		return version
+	}
+	parts := make([]string, 0, 2)
+	if commit != "" {
+		parts = append(parts, commit)
+	}
+	if date != "" {
+		parts = append(parts, date)
+	}
+	return fmt.Sprintf("%s (%s)", version, strings.Join(parts, ", "))
+}
 
 func main() {
 	os.Exit(orchMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -44,7 +69,7 @@ func orchMain(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	case "resume":
 		return cmdResume(args[1:], stdin, stdout, stderr)
 	case "version", "-v", "--version":
-		fmt.Fprintf(stdout, "orch %s\n", version)
+		fmt.Fprintf(stdout, "orch %s\n", versionString())
 		return 0
 	case "help", "-h", "--help":
 		usage(stdout)

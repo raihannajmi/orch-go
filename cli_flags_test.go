@@ -81,3 +81,25 @@ func TestUsageMentionsJSON(t *testing.T) {
 		t.Error("usage does not mention --json")
 	}
 }
+
+// TestVersionString covers the build-metadata rendering: a plain build keeps the
+// simple output, and injected metadata is appended.
+func TestVersionString(t *testing.T) {
+	oldVersion, oldCommit, oldDate := version, commit, date
+	t.Cleanup(func() { version, commit, date = oldVersion, oldCommit, oldDate })
+
+	version, commit, date = "0.1.0", "", ""
+	if got := versionString(); got != "0.1.0" {
+		t.Errorf("versionString() = %q, want %q", got, "0.1.0")
+	}
+
+	version, commit, date = "1.2.3", "abc1234", "2026-09-22T00:00:00Z"
+	if got := versionString(); got != "1.2.3 (abc1234, 2026-09-22T00:00:00Z)" {
+		t.Errorf("versionString() = %q", got)
+	}
+
+	version, commit, date = "1.2.3", "", "2026-09-22T00:00:00Z"
+	if got := versionString(); got != "1.2.3 (2026-09-22T00:00:00Z)" {
+		t.Errorf("versionString() = %q", got)
+	}
+}
