@@ -6,11 +6,11 @@ module github.com/raihannajmi/orch-go
 // advisory govulncheck reports for this code (GO-2026-4602, reached through
 // os.ReadDir; fixed in 1.25.8), so the documented `govulncheck ./...` run is
 // clean on any supported toolchain. CI builds the latest patch of this minor.
-go 1.25.8
+go 1.26.0
 
 require (
 	github.com/creack/pty v1.1.24
-	golang.org/x/term v0.45.0
+	golang.org/x/term v0.46.0
 )
 
-require golang.org/x/sys v0.47.0
+require golang.org/x/sys v0.48.0
