@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -150,6 +151,97 @@ func TestResumeRerunsStageWithoutMarker(t *testing.T) {
 	}
 }
 
+// TestCmdResumeRefusesSymlinkedState covers the documented guarantee that a
+// symlinked .orch is refused. `build` enforces it; `resume` is also a write path
+// (it rewrites run.json and writes stage transcripts), so it must not let an
+// untrusted repository redirect those writes through a symlink.
+func TestCmdResumeRefusesSymlinkedState(t *testing.T) {
+	mkRun := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir run: %v", err)
+		}
+		// A run that would otherwise look resumable, so only the symlink stops it.
+		if err := writeRunState(dir, runState{
+			Version: runStateVersion, ID: "20260101-120000", Task: "t",
+			Status: runStateRunning,
+			Stages: []stageState{{Name: "1-plan", Agent: "agy", Artifact: "1-plan.md", Status: stageRunning}},
+		}); err != nil {
+			t.Fatalf("writeRunState: %v", err)
+		}
+	}
+
+	t.Run("state directory is a symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		target := t.TempDir()
+		mkRun(t, filepath.Join(target, "20260101-120000"))
+		link := filepath.Join(dir, buildStateDir)
+		if err := os.Symlink(target, link); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skip("symlinks are not generally available on Windows")
+			}
+			t.Skipf("symlink unavailable: %v", err)
+		}
+
+		var out, errb bytes.Buffer
+		if got := cmdResume([]string{"20260101-120000"}, nil, &out, &errb); got != 1 {
+			t.Fatalf("cmdResume = %d, want 1 (stderr: %s)", got, errb.String())
+		}
+		if !strings.Contains(errb.String(), "symlink") {
+			t.Errorf("stderr = %q, want a symlink refusal", errb.String())
+		}
+		// Nothing may have been written through the link.
+		if _, err := os.Stat(filepath.Join(target, workflowLockFile)); err == nil {
+			t.Error("resume took the workflow lock through the symlinked .orch")
+		}
+		if _, err := os.Stat(filepath.Join(target, "20260101-120000", runLockFile)); err == nil {
+			t.Error("resume took the run lock through the symlinked .orch")
+		}
+	})
+
+	t.Run("run directory is a symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Chdir(dir)
+		stateDir := filepath.Join(dir, buildStateDir)
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
+			t.Fatalf("mkdir state dir: %v", err)
+		}
+		real := filepath.Join(dir, "elsewhere")
+		mkRun(t, real)
+		if err := os.Symlink(real, filepath.Join(stateDir, "20260101-120000")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+
+		var out, errb bytes.Buffer
+		if got := cmdResume([]string{"20260101-120000"}, nil, &out, &errb); got != 1 {
+			t.Fatalf("cmdResume = %d, want 1 (stderr: %s)", got, errb.String())
+		}
+		if !strings.Contains(errb.String(), "symlink") {
+			t.Errorf("stderr = %q, want a symlink refusal", errb.String())
+		}
+		if _, err := os.Stat(filepath.Join(real, runLockFile)); err == nil {
+			t.Error("resume took the run lock through the symlinked run directory")
+		}
+	})
+}
+
+// TestCmdResumeUnknownRunCreatesNoState pins that resuming an unknown id is a
+// pure read: it must not create a .orch directory as a side effect.
+func TestCmdResumeUnknownRunCreatesNoState(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	var out, errb bytes.Buffer
+	if got := cmdResume([]string{"20250101-000000"}, nil, &out, &errb); got != 2 {
+		t.Fatalf("cmdResume = %d, want 2 (stderr: %s)", got, errb.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, buildStateDir)); !os.IsNotExist(err) {
+		t.Errorf("resume created %s for an unknown run (stat err = %v)", buildStateDir, err)
+	}
+}
+
+// TestCmdResumeUsageErrors covers the id and flag validation of resume.
 func TestCmdResumeUsageErrors(t *testing.T) {
 	t.Chdir(t.TempDir())
 	tests := []struct {

@@ -141,9 +141,10 @@ func (a Agent) checkAllowed(flags []string) error {
 // checkPermissionFlags rejects argv entries that would hand an agent blanket
 // approval. It inspects real arguments, not arbitrary text: a value belonging to
 // some other flag (a prompt, a model name) is never itself read as a flag. It
-// understands `--flag=value`, `--flag value`, exact short flags, and single-dash
-// clusters such as -cy (continue + yolo). Scanning stops at `--`, after which
-// the remaining arguments are positional for the agent.
+// understands `--flag=value`, `--flag value`, exact short flags, and both a
+// leading short flag and single-dash clusters such as -cy (continue + yolo).
+// Scanning stops at `--`, after which the remaining arguments are positional for
+// the agent.
 func checkPermissionFlags(argv []string, deny []denyFlag) error {
 	for i, arg := range argv {
 		if arg == "--" {
@@ -157,7 +158,15 @@ func checkPermissionFlags(argv []string, deny []denyFlag) error {
 		if reason := deniedReason(name, value, hasValue, next, deny); reason != "" {
 			return fmt.Errorf("%s", reason)
 		}
-		// A single-dash cluster packs several short flags; check each one.
+		// A single-dash token is a short flag: its first character is the first
+		// flag whatever follows, so `-yX` is `-y` (then -X in a cluster, or an
+		// attached value) either way. The leading flag is checked for every such
+		// token; a plain lowercase cluster is unpacked further.
+		if len(name) > 1 && name[0] == '-' && name[1] != '-' {
+			if reason := deniedReason("-"+string(name[1]), "", false, "", deny); reason != "" {
+				return fmt.Errorf("%s", reason)
+			}
+		}
 		for _, short := range shortCluster(name) {
 			if reason := deniedReason(short, "", false, "", deny); reason != "" {
 				return fmt.Errorf("%s", reason)

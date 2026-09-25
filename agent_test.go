@@ -175,6 +175,50 @@ func TestClusteredShortFlags(t *testing.T) {
 	}
 }
 
+// TestClusteredShortFlagLeadingBypass covers the denylist gap where a
+// permission-suppressing short flag leads a token whose tail is not a plain
+// lowercase cluster. `-yX` cannot be an attached value of a preceding flag: the
+// first character is the flag, so for a boolean short flag it is `-y` (yolo)
+// plus `-X`, and for a value-taking one it is `-y X`. Both mean the same
+// bypass, so the leading flag alone is decisive and no legitimate attached value
+// is refused by checking it.
+//
+// A denied short flag that is NOT the leading character of a mixed-case token
+// (e.g. `-cyX`) stays allowed on purpose: syntactically it is identical to a
+// legitimate attached value such as `-Ctmp`, which the capital-letter heuristic
+// exists to protect, so unpicking it would refuse real arguments. Plain
+// lowercase clusters (`-cy`, `-ylong`) are unpacked and still refused.
+func TestClusteredShortFlagLeadingBypass(t *testing.T) {
+	for _, a := range agents {
+		for _, args := range [][]string{
+			{"-yX"}, {"-y1"}, {"-y/tmp"}, {"-ylong"}, {"-yc"}, {"-yXc"},
+		} {
+			if _, err := buildArgv(a, runOptions{extra: args}); err == nil {
+				t.Errorf("agent %s accepted bypass token %q (leading -y must be refused)", a.Name, args)
+			}
+		}
+	}
+
+	// -t is only command-code's trust flag; the same shape must be caught there.
+	cc, _ := lookupAgent("command-code")
+	if _, err := buildArgv(cc, runOptions{extra: []string{"-tX"}}); err == nil {
+		t.Error("command-code accepted -tX (leading -t is --trust)")
+	}
+	// But -t means nothing to agy, so a token leading with it is not a bypass.
+	agy, _ := lookupAgent("agy")
+	if _, err := buildArgv(agy, runOptions{extra: []string{"-tX"}}); err != nil {
+		t.Errorf("agy refused a token whose leading -t is not one of its flags: %v", err)
+	}
+
+	// An attached value whose first character is not a denied short flag must
+	// still pass, so the check does not refuse legitimate spellings.
+	for _, a := range agents {
+		if _, err := buildArgv(a, runOptions{extra: []string{"-Ctmp", "-mopus"}}); err != nil {
+			t.Errorf("agent %s refused a legitimate attached value: %v", a.Name, err)
+		}
+	}
+}
+
 // TestTaskTextIsNeverTreatedAsFlags is requirement 3: a prompt that merely
 // mentions a bypass flag is data and must pass through untouched.
 func TestTaskTextIsNeverTreatedAsFlags(t *testing.T) {

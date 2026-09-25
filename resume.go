@@ -41,8 +41,25 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	}
 
 	runDir := filepath.Join(buildStateDir, id)
-	if info, err := os.Stat(runDir); err != nil || !info.IsDir() {
+	// Refuse a symlinked state directory or run directory exactly as `orch build`
+	// does. Resume rewrites run state and writes stage transcripts under .orch,
+	// so an untrusted repository must not be able to point those writes at a
+	// directory of its choosing. Lstat, not Stat, so the check sees the symlink
+	// instead of following it. The run directory is checked first, so an unknown
+	// id is reported without creating any state.
+	info, err := os.Lstat(runDir)
+	if err != nil {
 		return cliError("resume", asJSON, stdout, stderr, 2, "unknown run %q (see `orch status`)", id)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return cliError("resume", asJSON, stdout, stderr, 1, "%s is a symlink; refusing to use it for run state", runDir)
+	}
+	if !info.IsDir() {
+		return cliError("resume", asJSON, stdout, stderr, 2, "unknown run %q (see `orch status`)", id)
+	}
+	stateDir := filepath.Dir(runDir)
+	if err := ensureStateDir(stateDir); err != nil {
+		return cliError("resume", asJSON, stdout, stderr, 1, "%v", err)
 	}
 
 	st, err := readRunState(runDir)
@@ -56,7 +73,6 @@ func cmdResume(args []string, stdin *os.File, stdout, stderr io.Writer) int {
 	// Serialize whole workflows per repository, exactly as `orch build` does, and
 	// before the per-run lock. Taking them in this order everywhere (workflow
 	// then run) means a build and a resume can never deadlock against each other.
-	stateDir := filepath.Dir(runDir)
 	workflowLock, err := lockWorkflow(stateDir)
 	if errors.Is(err, errRunLocked) {
 		return cliError("resume", asJSON, stdout, stderr, 2, "another orch workflow is already running in this repository; refusing to resume %s concurrently", id)
