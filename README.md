@@ -20,10 +20,14 @@ A minimal Go CLI orchestrator that runs coding agents in real pseudo-terminals (
 ### Install from source
 
 ```sh
-go install github.com/raihannajmi/orch-go@latest   # installs `orch` into $(go env GOPATH)/bin
+go install github.com/raihannajmi/orch-go@latest   # installs `orch-go` into $(go env GOPATH)/bin
 # or, from a checkout:
 go build -o orch .
 ```
+
+`go install` names the binary after the module path (`orch-go`); the `-o orch`
+build, or renaming the installed binary, gives the `orch` command spelled
+throughout this document.
 
 Release builds embed the version, commit and date:
 
@@ -70,7 +74,7 @@ The agent registry is defined in `agent.go`:
 `orch` strictly enforces that no permissions are bypassed or auto-approved. It never injects approval-skipping flags, and every argument the agent's parser could read as a flag is checked against a denylist before launch. The boundary has two gates:
 
 - **Per-agent allowlist:** the only flags `orch` itself may place on the command line are those an agent declares (`--continue`, and the prompt flag). `buildArgv` fails closed if it would emit anything else, so a bad registry entry cannot silently weaken a session.
-- **Bypass denylist:** the user's pass-through arguments are refused when they name a permission-suppressing flag. Both `--flag value` and `--flag=value` spellings are handled, values are matched case-insensitively, and single-dash clusters are expanded (`-cy` is caught as `continue` + `yolo`). Scanning stops at `--`, after which arguments are positional for the agent.
+- **Bypass denylist:** the user's pass-through arguments are refused when they name a permission-suppressing flag. Both `--flag value` and `--flag=value` spellings are handled, values are matched case-insensitively, and single-dash clusters are expanded (`-cy` is caught as `continue` + `yolo`). The first short flag of any single-dash token is always checked, so a mixed-case spelling such as `-yX` is refused too, while an attached value such as `-Ctmp` is left alone. Scanning stops at `--`, after which arguments are positional for the agent.
 - **Text is not a flag:** a prompt carried as a flag value (agy, copilot) is data and is never scanned; only a positional prompt (command-code) is checked, because there the agent's own parser would read a leading `-` as a flag.
 
 Blocked flags include:
@@ -210,7 +214,7 @@ Every stage is an interactive session, so after finishing its work the agent sta
 If a stage neither writes its marker nor exits within the per-stage timeout, the watchdog ends that session the same way (SIGTERM, then SIGKILL), records `<stage>.timeout` in the run directory, and stops the run — no later stage starts. This is the guard against a wedged prompt or a hung tool call blocking the workflow forever.
 
 **Artifacts Directory:**
-Every run creates a timestamped directory under `.orch/<run-id>/` containing Markdown reports and raw terminal transcripts:
+Every run creates a timestamped directory under `.orch/<run-id>/` holding the Markdown reports, their raw terminal transcripts, and the run's own state and lock files:
 ```
 .orch/20260921-170242/
 ├── 1-plan.md
@@ -221,6 +225,8 @@ Every run creates a timestamped directory under `.orch/<run-id>/` containing Mar
 ├── 3-implement.log
 ├── 4-review.md
 ├── 4-review.log
+├── run.json
+├── run.lock
 └── verify.log
 ```
 
@@ -248,7 +254,7 @@ ORCH_KNOWLEDGE_VAULT=~/Obsidian/myvault ORCH_KNOWLEDGE_GRAPHIFY=1 \
 ```
 
 - **Obsidian is the source of truth.** It provides the project context and related notes, and it is the only place durable knowledge is written.
-- **Graphify is optional enrichment.** When enabled independently via `ORCH_KNOWLEDGE_GRAPHIFY`, orch runs the documented `graphify query "<task>" --graph <graph.json>` CLI and adds the returned subgraph as extra reference context. Graphify is *never* a hard dependency: with the flag unset (or the CLI/graph missing) Obsidian works exactly as before. orch speaks no MCP protocol itself; the CLI is the supported mechanism.
+- **Graphify is optional enrichment.** When enabled independently via `ORCH_KNOWLEDGE_GRAPHIFY`, orch runs `graphify query --graph <graph.json> -- "<task>"` and adds the returned subgraph as extra reference context (the task follows the `--` terminator, so a task that looks like a flag can never change the invocation). Graphify is *never* a hard dependency: with the flag unset (or the CLI/graph missing) Obsidian works exactly as before. orch speaks no MCP protocol itself; the CLI is the supported mechanism.
 - **Retrieval:** before planning, orch reads the project's context note plus only the decisions/problems/learning notes whose filenames match the task. The whole vault is never read. Graphify is queried for relationships, not ingested wholesale.
 - **Trust boundary:** loaded knowledge — Obsidian and Graphify alike — is untrusted data. It is injected into the planning prompt only inside an explicit `<external_knowledge>…</external_knowledge>` fence, labeled as reference material that must not be followed as instructions, and it can never override the task or the workflow instructions. Content is preserved as-is (nothing is filtered), and a note cannot close the fence early because its own boundary tags are neutralized.
 - **Capture:** after an approved run, orch appends one entry to the project's single `build-log.md`. It updates that note rather than creating a note per run, and never writes prompts, transcripts, or debugging output. Graphify is read-only and never receives captured knowledge.
@@ -270,7 +276,7 @@ RUN-ID            STAGES  VERDICT   TIMED OUT
 
 ### `orch logs <run-id>`
 
-Lists the artifacts of a single run — the numbered Markdown reports and their raw terminal transcripts, plus `verify.log` — in stage order with their sizes. The `<run-id>` is the timestamp directory name under `.orch/` and the first column of `orch status`. Invalid, unknown, or path-traversing run ids are rejected with exit code `2`.
+Lists the files of a single run — the numbered Markdown reports and their raw terminal transcripts first, then the unnumbered ones (`run.json`, `run.lock`, `verify.log`, and any `<stage>.timeout`) — with their sizes. The `<run-id>` is the timestamp directory name under `.orch/` and the first column of `orch status`. Invalid, unknown, or path-traversing run ids are rejected with exit code `2`.
 
 ```sh
 orch logs 20260921-180819
@@ -282,6 +288,8 @@ artifacts in .orch/20260921-180819:
   1-plan.md            3.5 KB
   2-plan-review.log  814.5 KB
   ...
+  run.json            1.2 KB
+  run.lock                0 B
   verify.log             19 B
 ```
 
